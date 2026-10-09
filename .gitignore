@@ -14,4 +14,6 @@ dist/
 frontend/.next/
 frontend/node_modules/
 frontend/out/
-
+*.har
+*.jsonl
+test_dump.*
