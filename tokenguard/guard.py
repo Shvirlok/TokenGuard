@@ -6,7 +6,6 @@ import collections
 import hashlib
 import json
 import logging
-import os
 import platform
 import shutil
 import subprocess
@@ -206,16 +205,18 @@ class CircuitBreaker:
         return [h for _, h in self.recent_hashes]
 
     def _load_prices(self) -> Dict[str, Dict[str, float]]:
-        """Load pricing table from prices.json or fallback defaults."""
-        if self.prices_path and self.prices_path.exists():
-            try:
-                with open(self.prices_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data
-            except Exception as e:
-                logger.warning(f"Failed to load prices from {self.prices_path}: {e}. Using defaults.")
-
-        return dict(DEFAULT_PRICES)
+        """Load pricing table from dynamic registry, custom prices.json, or fallback defaults."""
+        try:
+            from tokenguard.pricing import get_dynamic_pricing_table
+            return get_dynamic_pricing_table(self.prices_path)
+        except Exception:
+            if self.prices_path and self.prices_path.exists():
+                try:
+                    with open(self.prices_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+            return dict(DEFAULT_PRICES)
 
     def get_model_pricing(self, model: str) -> Dict[str, float]:
         """Lookup token pricing for a given model name with prefix and fallback handling."""
@@ -323,7 +324,7 @@ class CircuitBreaker:
         2. At least (threshold - 1) previous requests exist in the active time window
         3. ALL of those previous (threshold - 1) requests match incoming_hash
         """
-        if self.loop_threshold <= 1:
+        if self.active_profile == "passive" or self.loop_threshold <= 1:
             return False
 
         now = time.time()
@@ -365,6 +366,11 @@ class CircuitBreaker:
         if self.kill_switch_active:
             raise KillSwitchActiveError()
 
+        # Passive mode bypasses loop & budget cutoffs for pure telemetry
+        if self.active_profile == "passive":
+            self.record_request_hash(prompt_hash)
+            return prompt_hash
+
         # 2. Infinite Loop Detection Check
         if self.check_loop(prompt_hash):
             if self.enable_notifications:
@@ -378,17 +384,19 @@ class CircuitBreaker:
             )
 
         # 3. Budget Guard Check
-        current_hourly_spend = self.get_hourly_spend()
-        estimated_cost = self.estimate_cost(model, messages)
+        if self.hourly_limit > 0:
+            current_hourly_spend = self.get_hourly_spend()
+            estimated_cost = self.estimate_cost(model, messages)
+            if (current_hourly_spend + estimated_cost) > self.hourly_limit:
+                # Rejection must NOT poison the history window
+                raise BudgetExceededError("TokenGuard: budget limit exceeded")
 
-        if (current_hourly_spend + estimated_cost) > self.hourly_limit:
-            # Rejection must NOT poison the history window
-            raise BudgetExceededError("TokenGuard: budget limit exceeded")
-
-        current_daily_spend = self.get_daily_spend()
-        if (current_daily_spend + estimated_cost) > self.daily_limit:
-            # Rejection must NOT poison the history window
-            raise BudgetExceededError("TokenGuard: daily budget limit exceeded")
+        if self.daily_limit > 0:
+            current_daily_spend = self.get_daily_spend()
+            estimated_cost = self.estimate_cost(model, messages)
+            if (current_daily_spend + estimated_cost) > self.daily_limit:
+                # Rejection must NOT poison the history window
+                raise BudgetExceededError("TokenGuard: daily budget limit exceeded")
 
         # Request passed all pre-flight checks: append to recent_hashes
         self.record_request_hash(prompt_hash)

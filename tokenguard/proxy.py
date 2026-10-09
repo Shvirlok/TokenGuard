@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import csv
-import io
 import json
 import logging
 import os
@@ -27,6 +25,12 @@ from tokenguard.db import (
     get_recent_requests,
     init_db,
     log_request,
+)
+from tokenguard.export import (
+    format_csv_export,
+    format_har_export,
+    format_json_export,
+    format_jsonl_export,
 )
 from tokenguard.guard import (
     BudgetExceededError,
@@ -93,6 +97,7 @@ async def lifespan(app: FastAPI):
         loop_window_seconds=settings.loop_window_seconds,
         prices_path=settings.prices_path,
         kill_switch=settings.kill_switch,
+        active_profile=settings.profile,
     )
 
     # Persistent HTTP client for upstream proxying
@@ -148,388 +153,6 @@ async def _record_and_broadcast_request(
     await broadcaster.broadcast("request_logged", req_payload)
     return rec_id
 
-
-def create_app(settings: Optional[Settings] = None) -> FastAPI:
-    """Create and configure the FastAPI application."""
-    if settings is None:
-        settings = get_settings()
-
-    app = FastAPI(
-        title="TokenGuard",
-        description="Lightweight local proxy and circuit breaker for LLM calls",
-        version="0.1.0",
-        lifespan=lifespan,
-    )
-
-    # Enable CORS for browser dashboard and web clients
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Ensure static directory exists
-    static_dir = Path(settings.static_path)
-    static_dir.mkdir(parents=True, exist_ok=True)
-    index_file = static_dir / "index.html"
-    if not index_file.exists():
-        pass
-
-    # Mount static assets
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-    # --------------------------------------------------------------------------
-    # Frontend Dashboard Routes
-    # --------------------------------------------------------------------------
-    @app.get("/", include_in_schema=False)
-    @app.get("/dashboard", include_in_schema=False)
-    async def serve_dashboard():
-        """Serve the TokenGuard single-page dashboard."""
-        if index_file.exists():
-            return FileResponse(str(index_file))
-        return HTMLResponse("<h1>TokenGuard Dashboard is initializing...</h1>")
-
-    @app.get("/health")
-    async def health_check():
-        """Health check endpoint."""
-        return {
-            "status": "healthy",
-            "service": "TokenGuard",
-            "version": "0.1.0",
-            "kill_switch": circuit_breaker.kill_switch_active if circuit_breaker else False,
-        }
-
-    # --------------------------------------------------------------------------
-    # Dashboard API Endpoints
-    # --------------------------------------------------------------------------
-    @app.get("/api/stats")
-    async def api_stats():
-        """Get aggregate metrics, spending status, and circuit breaker health."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        current_settings = get_settings()
-        metrics = await get_metrics(
-            current_settings.db_path,
-            time_window_hours=1.0,
-            prices=circuit_breaker.prices,
-        )
-        cb_state = circuit_breaker.get_state()
-
-        return {
-            **metrics,
-            **cb_state,
-            "prices_count": len(circuit_breaker.prices),
-        }
-
-    @app.get("/api/requests")
-    async def api_requests(
-        limit: int = 50,
-        offset: int = 0,
-        status: Optional[str] = None,
-    ):
-        """Retrieve recent LLM requests logged in SQLite."""
-        current_settings = get_settings()
-        records = await get_recent_requests(
-            current_settings.db_path,
-            limit=min(limit, 200),
-            offset=offset,
-            status_filter=status,
-        )
-        return {"requests": records, "count": len(records)}
-
-    @app.get("/api/export")
-    async def api_export(
-        format: str = "json",
-        status: Optional[str] = None,
-    ):
-        """Export all logged requests in CSV or JSON format."""
-        current_settings = get_settings()
-        records = await get_all_requests_for_export(
-            current_settings.db_path,
-            status_filter=status,
-        )
-
-        format_clean = format.strip().lower()
-        if format_clean == "csv":
-            output = io.StringIO()
-            fieldnames = [
-                "id",
-                "timestamp",
-                "model",
-                "prompt_tokens",
-                "completion_tokens",
-                "total_tokens",
-                "cost_usd",
-                "latency_ms",
-                "prompt_hash",
-                "status",
-                "blocked_reason",
-            ]
-            writer = csv.DictWriter(output, fieldnames=fieldnames)
-            writer.writeheader()
-            for rec in records:
-                writer.writerow(rec)
-
-            return Response(
-                content=output.getvalue(),
-                media_type="text/csv",
-                headers={
-                    "Content-Disposition": 'attachment; filename="tokenguard_requests.csv"',
-                },
-            )
-        elif format_clean == "json":
-            json_str = json.dumps({"requests": records, "count": len(records)}, indent=2)
-            return Response(
-                content=json_str,
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": 'attachment; filename="tokenguard_requests.json"',
-                },
-            )
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported export format '{format}'. Supported formats: 'json', 'csv'",
-            )
-
-    @app.get("/api/history")
-    async def api_history(hours: int = 24):
-        """Retrieve hourly spend and request breakdown for chart rendering."""
-        current_settings = get_settings()
-        history = await get_hourly_history(current_settings.db_path, hours=min(hours, 72))
-        return {"history": history}
-
-    @app.get("/api/stream")
-    async def api_stream(request: Request):
-        """Server-Sent Events endpoint broadcasting live state changes and logged requests in real-time."""
-        async def event_generator():
-            q = broadcaster.subscribe()
-            try:
-                # Immediately emit current state upon connection
-                if circuit_breaker is not None:
-                    initial_state = circuit_breaker.get_state()
-                    yield f"event: initial_state\ndata: {json.dumps(initial_state)}\n\n"
-
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    try:
-                        payload = await asyncio.wait_for(q.get(), timeout=15.0)
-                        event_name = payload.get("event", "message")
-                        event_data = json.dumps(payload.get("data", {}))
-                        yield f"event: {event_name}\ndata: {event_data}\n\n"
-                    except asyncio.TimeoutError:
-                        yield ": ping\n\n"
-            finally:
-                broadcaster.unsubscribe(q)
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    @app.post("/api/kill-switch")
-    async def api_toggle_kill_switch(payload: Optional[Dict[str, Any]] = None):
-        """Toggle or set the manual kill switch and broadcast state change."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        active_target = payload.get("active") if payload and "active" in payload else None
-        source = payload.get("source", "web") if payload else "web"
-        new_state = circuit_breaker.toggle_kill_switch(active_target)
-        action_text = "Kill Switch Engaged" if new_state else "Traffic Resumed"
-
-        state_data = {
-            **circuit_breaker.get_state(),
-            "source": source,
-            "action": action_text,
-        }
-        await broadcaster.broadcast("state_change", state_data)
-
-        return {
-            "kill_switch_active": new_state,
-            "message": action_text,
-            "state": state_data,
-        }
-
-    @app.post("/api/config")
-    async def api_update_config(payload: Dict[str, Any]):
-        """Dynamically update limits (hourly budget, daily budget, loop threshold, profile)."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        hourly_limit = payload.get("hourly_limit")
-        daily_limit = payload.get("daily_limit")
-        loop_threshold = payload.get("loop_threshold")
-        profile = payload.get("profile")
-        source = payload.get("source", "web")
-
-        circuit_breaker.update_limits(
-            hourly_limit=hourly_limit,
-            daily_limit=daily_limit,
-            loop_threshold=loop_threshold,
-            profile=profile,
-        )
-
-        action_text = f"Profile set to {str(profile).capitalize()}" if profile else "Limits updated"
-        state_data = {
-            **circuit_breaker.get_state(),
-            "source": source,
-            "action": action_text,
-        }
-        await broadcaster.broadcast("state_change", state_data)
-
-        return {
-            "status": "updated",
-            "state": state_data,
-        }
-
-    @app.post("/api/reset")
-    async def api_reset(payload: Optional[Dict[str, Any]] = None):
-        """Reset in-memory circuit breaker state, spending tracking, and hash history."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        source = payload.get("source", "web") if payload else "web"
-        circuit_breaker.reset()
-        state_data = {
-            **circuit_breaker.get_state(),
-            "source": source,
-            "action": "Circuit breaker in-memory state cleared",
-        }
-        await broadcaster.broadcast("state_change", state_data)
-
-        return {
-            "status": "reset",
-            "message": "Circuit breaker in-memory state and hash history cleared",
-            "state": state_data,
-        }
-
-    @app.post("/api/clear-logs")
-    async def api_clear_logs(payload: Optional[Dict[str, Any]] = None):
-        """Clear database request logs and reset in-memory circuit breaker state."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        source = payload.get("source", "web") if payload else "web"
-        current_settings = get_settings()
-        await clear_all_requests(current_settings.db_path)
-        circuit_breaker.reset()
-
-        state_data = {
-            **circuit_breaker.get_state(),
-            "source": source,
-            "action": "All logs and metrics cleared",
-        }
-        await broadcaster.broadcast("logs_cleared", state_data)
-
-        return {
-            "status": "cleared",
-            "message": "All database logs and in-memory circuit breaker state cleared",
-            "state": state_data,
-        }
-
-    @app.post("/api/simulate")
-    async def api_simulate(payload: Optional[Dict[str, Any]] = None):
-        """Simulate LLM events (loop test, standard request, budget spike) for instant onboarding testing."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-
-        payload = payload or {}
-        sim_type = payload.get("type", "loop")
-        model = str(payload.get("model", "gpt-4o"))
-        current_settings = get_settings()
-
-        if sim_type == "loop":
-            # Simulate consecutive loop attempts up to loop_threshold
-            sample_messages = [{"role": "user", "content": "Rogue agent repeating identical prompt sequence for simulation"}]
-            prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
-            est_tokens = circuit_breaker.estimate_prompt_tokens(sample_messages)
-
-            results = []
-            for i in range(1, circuit_breaker.loop_threshold + 1):
-                try:
-                    circuit_breaker.check_request(sample_messages, model)
-                    cost = circuit_breaker.compute_cost(model, est_tokens, 150)
-                    circuit_breaker.record_success(model, est_tokens, 150, cost, prompt_hash)
-                    await _record_and_broadcast_request(
-                        db_path=current_settings.db_path,
-                        model=model,
-                        prompt_tokens=est_tokens,
-                        completion_tokens=150,
-                        cost_usd=cost,
-                        latency_ms=160 + i * 20,
-                        prompt_hash=prompt_hash,
-                        status="success",
-                    )
-                    results.append({"attempt": i, "status": "allowed", "cost": cost})
-                except LoopDetectedError as err:
-                    await _record_and_broadcast_request(
-                        db_path=current_settings.db_path,
-                        model=model,
-                        prompt_tokens=est_tokens,
-                        completion_tokens=0,
-                        cost_usd=0.0,
-                        latency_ms=0,
-                        prompt_hash=prompt_hash,
-                        status="blocked_loop",
-                        blocked_reason=err.message,
-                    )
-                    results.append({"attempt": i, "status": "blocked_loop", "message": err.message})
-
-            return {"simulation": "loop", "results": results, "threshold": circuit_breaker.loop_threshold}
-
-        elif sim_type == "success":
-            sample_messages = [{"role": "user", "content": f"Simulated user prompt #{int(time.time())}"}]
-            prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
-            est_tokens = 85
-            completion_tokens = 140
-            cost = circuit_breaker.compute_cost(model, est_tokens, completion_tokens)
-            circuit_breaker.record_success(model, est_tokens, completion_tokens, cost, prompt_hash)
-            await _record_and_broadcast_request(
-                db_path=current_settings.db_path,
-                model=model,
-                prompt_tokens=est_tokens,
-                completion_tokens=completion_tokens,
-                cost_usd=cost,
-                latency_ms=210,
-                prompt_hash=prompt_hash,
-                status="success",
-            )
-            return {"simulation": "success", "model": model, "cost": cost}
-
-        elif sim_type == "budget":
-            sample_messages = [{"role": "user", "content": "Simulated heavy payload budget overrun"}]
-            prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
-            await _record_and_broadcast_request(
-                db_path=current_settings.db_path,
-                model=model,
-                prompt_tokens=30000,
-                completion_tokens=0,
-                cost_usd=0.0,
-                latency_ms=0,
-                prompt_hash=prompt_hash,
-                status="blocked_budget",
-                blocked_reason="TokenGuard: budget limit exceeded",
-            )
-            return {"simulation": "budget", "status": "blocked_budget"}
-
-        return {"status": "unknown simulation type"}
-
-    @app.get("/api/prices")
-    async def api_prices():
-        """Get the current pricing table."""
-        if circuit_breaker is None:
-            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
-        return {"prices": circuit_breaker.prices}
 
 def detect_provider(model: str) -> str:
     """Detect upstream provider from model identifier."""
@@ -688,6 +311,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     # Mount static assets
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    next_dir = static_dir / "_next"
+    if next_dir.exists():
+        app.mount("/_next", StaticFiles(directory=str(next_dir)), name="next_static")
 
     # --------------------------------------------------------------------------
     # Frontend Dashboard Routes
@@ -697,7 +323,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def serve_dashboard():
         """Serve the TokenGuard single-page dashboard."""
         if index_file.exists():
-            return FileResponse(str(index_file))
+            return FileResponse(
+                str(index_file),
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         return HTMLResponse("<h1>TokenGuard Dashboard is initializing...</h1>")
 
     @app.get("/health")
@@ -752,10 +385,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get("/api/export")
     async def api_export(
-        format: str = "json",
+        format: str = "jsonl",
         status: Optional[str] = None,
     ):
-        """Export all logged requests in CSV or JSON format."""
+        """Export all logged requests in JSONL, HAR 1.2, CSV, or JSON format."""
         current_settings = get_settings()
         records = await get_all_requests_for_export(
             current_settings.db_path,
@@ -763,35 +396,36 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
 
         format_clean = format.strip().lower()
-        if format_clean == "csv":
-            output = io.StringIO()
-            fieldnames = [
-                "id",
-                "timestamp",
-                "model",
-                "prompt_tokens",
-                "completion_tokens",
-                "total_tokens",
-                "cost_usd",
-                "latency_ms",
-                "prompt_hash",
-                "status",
-                "blocked_reason",
-            ]
-            writer = csv.DictWriter(output, fieldnames=fieldnames)
-            writer.writeheader()
-            for rec in records:
-                writer.writerow(rec)
-
+        if format_clean == "har":
+            har_obj = format_har_export(records, host=current_settings.host, port=current_settings.port)
+            har_str = json.dumps(har_obj, indent=2)
             return Response(
-                content=output.getvalue(),
+                content=har_str,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": 'attachment; filename="tokenguard_requests.har"',
+                },
+            )
+        elif format_clean == "jsonl":
+            jsonl_str = format_jsonl_export(records)
+            return Response(
+                content=jsonl_str,
+                media_type="application/x-ndjson",
+                headers={
+                    "Content-Disposition": 'attachment; filename="tokenguard_requests.jsonl"',
+                },
+            )
+        elif format_clean == "csv":
+            csv_str = format_csv_export(records)
+            return Response(
+                content=csv_str,
                 media_type="text/csv",
                 headers={
                     "Content-Disposition": 'attachment; filename="tokenguard_requests.csv"',
                 },
             )
         elif format_clean == "json":
-            json_str = json.dumps({"requests": records, "count": len(records)}, indent=2)
+            json_str = format_json_export(records)
             return Response(
                 content=json_str,
                 media_type="application/json",
@@ -802,7 +436,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported export format '{format}'. Supported formats: 'json', 'csv'",
+                detail=f"Unsupported export format '{format}'. Supported formats: 'jsonl', 'har', 'json', 'csv'",
             )
 
     @app.get("/api/history")

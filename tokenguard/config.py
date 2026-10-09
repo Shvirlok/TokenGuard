@@ -44,10 +44,15 @@ class Settings(BaseSettings):
     static_path: Path = Field(default=DEFAULT_STATIC_PATH, description="Path to dashboard static assets")
     kill_switch: bool = Field(default=False, description="Manual kill switch flag to block all requests")
     timeout: float = Field(default=60.0, description="Upstream HTTP timeout in seconds")
+    profile: str = Field(default="careful", description="Active guard profile (careful, standard, passive)")
+    passive: bool = Field(default=False, description="Passive observability mode")
 
     def model_post_init(self, __context) -> None:
         if self.max_repeats is not None:
             self.loop_threshold = self.max_repeats
+        if self.passive or self.profile == "passive":
+            self.profile = "passive"
+            self.loop_threshold = 0
 
 
 USER_CONFIG_DIR = Path.home() / ".tokenguard"

@@ -46,6 +46,18 @@ async def get_db(db_path: Union[str, Path]) -> AsyncGenerator[aiosqlite.Connecti
         yield db
 
 
+@asynccontextmanager
+async def get_readonly_db(db_path: Union[str, Path]) -> AsyncGenerator[aiosqlite.Connection, None]:
+    """Create a read-only SQLite connection context in WAL mode without blocking writers."""
+    db_path = Path(db_path)
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA journal_mode = WAL;")
+        await db.execute("PRAGMA query_only = ON;")
+        await db.execute("PRAGMA busy_timeout = 5000;")
+        yield db
+
+
 async def init_db(db_path: Union[str, Path]) -> None:
     """Initialize SQLite database tables and indexes."""
     async with get_db(db_path) as db:
@@ -311,8 +323,8 @@ async def get_all_requests_for_export(
     db_path: Union[str, Path],
     status_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Retrieve all request records for export without limit."""
-    async with get_db(db_path) as db:
+    """Retrieve all request records for export without limit using a non-blocking read-only connection."""
+    async with get_readonly_db(db_path) as db:
         if status_filter and status_filter != "all":
             if status_filter == "blocked":
                 query = """
@@ -366,5 +378,3 @@ async def clear_all_requests(db_path: Union[str, Path]) -> None:
     async with get_db(db_path) as db:
         await db.execute("DELETE FROM requests;")
         await db.commit()
-
-

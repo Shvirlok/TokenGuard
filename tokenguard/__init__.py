@@ -9,9 +9,12 @@ from tokenguard.guard import (
     LoopDetectedError,
 )
 from tokenguard.proxy import create_app
+from tokenguard.sdk import guard, protect
 
 __version__ = "0.1.0"
 __all__ = [
+    "guard",
+    "protect",
     "Settings",
     "get_settings",
     "CircuitBreaker",

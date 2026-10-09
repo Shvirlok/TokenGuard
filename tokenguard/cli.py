@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import uvicorn
 from rich import box
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -35,6 +37,13 @@ from tokenguard.config import (
     set_settings,
     update_stored_config,
 )
+from tokenguard.export import export_telemetry_sync
+from tokenguard.pricing import (
+    get_dynamic_pricing_table,
+    load_baseline_prices,
+    load_cached_prices,
+    update_pricing_cache,
+)
 
 PID_DIR = Path.home() / ".tokenguard"
 PID_FILE = PID_DIR / "tokenguard.pid"
@@ -48,7 +57,7 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser with subcommands."""
     parser = argparse.ArgumentParser(
         prog="tokenguard",
-        description="🛡️ TokenGuard: Lightweight open-source local proxy and circuit breaker for LLM calls",
+        description="TokenGuard: Lightweight open-source local proxy and circuit breaker for LLM calls",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -83,6 +92,11 @@ def create_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
     run_parser.add_argument("--limit", type=float, default=5.0, help="Sliding hourly budget limit in USD (default: 5.0)")
     run_parser.add_argument("--daily-limit", type=float, default=50.0, help="Sliding daily budget limit in USD (default: 50.0)")
+    run_parser.add_argument(
+        "--passive",
+        action="store_true",
+        help="Run in passive observability mode (no loop or budget cutoffs)",
+    )
     run_parser.add_argument(
         "--max-repeats",
         "--loop-threshold",
@@ -154,6 +168,17 @@ def create_parser() -> argparse.ArgumentParser:
     # 10. Prices command
     prices_parser = subparsers.add_parser("prices", help="Display local pricing table")
     prices_parser.add_argument(
+        "-u",
+        "--update",
+        action="store_true",
+        help="Fetch latest live model prices from OpenRouter public registry",
+    )
+    prices_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Display offline static baseline pricing only",
+    )
+    prices_parser.add_argument(
         "--prices-path",
         type=Path,
         default=None,
@@ -180,6 +205,51 @@ def create_parser() -> argparse.ArgumentParser:
     sim_parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for simulation")
     sim_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     sim_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
+
+    # 14. Export command (Telemetry Export)
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Export telemetry logs in JSONL, HAR 1.2, JSON, or CSV format",
+    )
+    export_parser.add_argument(
+        "--format",
+        type=str,
+        default="jsonl",
+        choices=["jsonl", "har", "json", "csv"],
+        help="Export file format: jsonl (default), har (HTTP Archive 1.2), json, or csv",
+    )
+    export_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output file path (auto-named if not specified)",
+    )
+    export_parser.add_argument(
+        "--status",
+        type=str,
+        default="all",
+        choices=["all", "success", "blocked"],
+        help="Filter records by status: all (default), success, or blocked",
+    )
+    export_parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=Path("tokenguard.db"),
+        help="SQLite database path (default: tokenguard.db)",
+    )
+    export_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Proxy host address (default: 127.0.0.1)",
+    )
+    export_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Proxy port (default: 8080)",
+    )
 
     # Also allow root flags for quick default start
     _add_server_args(parser)
@@ -218,6 +288,11 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         type=float,
         default=50.0,
         help="Sliding daily budget limit in USD (default: 50.0)",
+    )
+    p.add_argument(
+        "--passive",
+        action="store_true",
+        help="Run in passive observability mode (no loop or budget cutoffs)",
     )
     p.add_argument(
         "--max-repeats",
@@ -333,6 +408,7 @@ def start_daemon(
     loop_window_seconds: float = 60.0,
     upstream_url: str = "https://api.openai.com",
     db_path: Path = Path("tokenguard.db"),
+    passive: bool = False,
 ) -> int:
     """Spawn TokenGuard proxy in background as a daemon process."""
     existing_pid = get_daemon_pid()
@@ -363,6 +439,8 @@ def start_daemon(
         "--db-path",
         str(db_path),
     ]
+    if passive:
+        cmd.append("--passive")
 
     log_file = open(LOG_FILE, "a", encoding="utf-8")
     proc = subprocess.Popen(
@@ -387,7 +465,7 @@ def stop_daemon(host: str = "127.0.0.1", port: int = 8080) -> bool:
         if is_server_running(host, port):
             console.print(
                 Panel(
-                    f"[yellow]⚠️ TokenGuard proxy is responding on http://{host}:{port}, but no daemon PID file was found ({PID_FILE}).[/yellow]\n"
+                    f"[yellow]Warning: TokenGuard proxy is responding on http://{host}:{port}, but no daemon PID file was found ({PID_FILE}).[/yellow]\n"
                     f"[dim]If it was started directly in another terminal, terminate it there.[/dim]",
                     title="[bold bright_white]TokenGuard[/bold bright_white]",
                     box=box.ROUNDED,
@@ -597,7 +675,6 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
 
 def _read_raw_key(fd: int) -> str:
-    """Read a raw keystroke or ANSI escape sequence from a cbreak file descriptor."""
     if sys.platform == "win32":
         try:
             import msvcrt
@@ -671,45 +748,91 @@ def _read_key() -> str:
     return _read_raw_key(sys.stdin.fileno())
 
 
+def format_col1(i: int, is_selected: bool, total_count: int = 10) -> str:
+    """Format index & selector string: '› [ 1 ]' to '  [10 ]' (fixed width 8 chars)."""
+    val = i + 1
+    if total_count >= 10:
+        if val < 10:
+            s = f"› [ {val} ]" if is_selected else f"  [ {val} ]"
+        else:
+            s = f"› [{val} ]" if is_selected else f"  [{val} ]"
+    else:
+        s = f"› [ {val} ]" if is_selected else f"  [ {val} ]"
+
+    if is_selected:
+        return f"[bold cyan]{s}[/bold cyan]"
+    return f"[dim]{s}[/dim]"
+
+
 def render_interactive_menu(
     options: list[tuple[str, str, str, str]],
     selected_idx: int,
     title: str = "Select Option",
     subtitle: Optional[str] = None,
+    status_line: Optional[str] = None,
 ) -> Panel:
-    """Render a clean Rich panel with numbered, arrow-navigable menu options."""
-    table = Table.grid(padding=(0, 2))
-    table.add_column(justify="left", style="bold")
-    table.add_column(justify="left")
-    table.add_column(justify="left", style="dim")
-    table.add_column(justify="right")
+    """Render a clean Rich panel with numbered, arrow-navigable menu options with explicit column widths."""
+    table = Table.grid(padding=(0, 1), expand=False)
+    table.add_column(width=8, justify="left", no_wrap=True)   # Column 1: Index & Selector
+    table.add_column(width=24, justify="left", no_wrap=True)  # Column 2: Action Title
+    table.add_column(width=1, justify="center", no_wrap=True) # Column 3: Subtle separator '·'
+    table.add_column(width=32, justify="left", no_wrap=True)  # Column 4: Description
+    table.add_column(width=6, justify="right", no_wrap=True)  # Column 5: Badge/Tag
 
-    for i, (opt_id, opt_title, opt_desc, opt_badge) in enumerate(options):
+    for i, opt in enumerate(options):
+        opt_id = opt[0]
+        opt_title = opt[1] if len(opt) > 1 else str(opt_id)
+        opt_desc = opt[2] if len(opt) > 2 else ""
+        opt_badge = opt[3] if len(opt) > 3 else ""
+
         is_selected = (i == selected_idx)
-        num_str = f"[{i + 1}]"
+        col1 = format_col1(i, is_selected, len(options))
 
         if is_selected:
-            prefix = f"[bold cyan]❯ {num_str}[/bold cyan]"
-            title_styled = f"[bold bright_white]{opt_title}[/bold bright_white]"
-            desc_styled = f"[bright_white]{opt_desc}[/bright_white]" if opt_desc else ""
-            badge_styled = f"[bold green]{opt_badge}[/bold green]" if opt_badge else ""
+            col2 = f"[bold bright_white]{escape(opt_title)}[/bold bright_white]"
+            col3 = "[dim]·[/dim]"
+            col4 = f"[bright_white]{escape(opt_desc)}[/bright_white]"
         else:
-            prefix = f"[dim]  {num_str}[/dim]"
-            title_styled = f"[white]{opt_title}[/white]"
-            desc_styled = f"[dim]{opt_desc}[/dim]" if opt_desc else ""
-            badge_styled = f"[dim]{opt_badge}[/dim]" if opt_badge else ""
+            col2 = f"[white]{escape(opt_title)}[/white]"
+            col3 = "[dim]·[/dim]"
+            col4 = f"[dim]{escape(opt_desc)}[/dim]"
 
-        table.add_row(prefix, title_styled, desc_styled, badge_styled)
+        if opt_badge.upper() == "LIVE":
+            col5 = "[dim cyan]LIVE[/dim cyan]"
+        elif opt_badge.upper() == "DEMO":
+            col5 = "[dim yellow]DEMO[/dim yellow]"
+        elif opt_badge:
+            col5 = f"[dim green]{escape(opt_badge[:6])}[/dim green]"
+        else:
+            col5 = ""
 
-    sub = subtitle or f"[dim]Use [bold white]↑/↓[/bold white] arrows or press [bold white]1-{len(options)}[/bold white], [bold white]Enter[/bold white] to confirm, [bold white]q[/bold white] to exit[/dim]"
+        table.add_row(col1, col2, col3, col4, col5)
+
+    elements = []
+    if status_line:
+        s_grid = Table.grid(expand=False)
+        s_grid.add_column(no_wrap=True)
+        s_grid.add_row(f" {status_line}")
+        s_grid.add_row("")
+        elements.append(s_grid)
+
+    elements.append(table)
+
+    content = Table.grid(expand=False)
+    content.add_column(no_wrap=True)
+    for el in elements:
+        content.add_row(el)
+
+    sub = subtitle or f"[dim]↑/↓ arrows or 1-{len(options)} to select · Enter to run · q to exit[/dim]"
 
     return Panel(
-        table,
-        title=f"[bold bright_white]{title}[/bold bright_white]",
+        content,
+        title=f"[bold bright_white]{escape(title)}[/bold bright_white]",
         subtitle=sub,
         box=box.ROUNDED,
         border_style="bright_black",
-        padding=(1, 2),
+        padding=(0, 1),
+        expand=False,
     )
 
 
@@ -717,6 +840,7 @@ def interactive_select(
     options: list[tuple[str, str, str, str]],
     title: str = "Select Option",
     subtitle: Optional[str] = None,
+    status_line: Optional[str] = None,
     default_index: int = 0,
 ) -> str:
     """Prompt user to choose an option using Arrow Keys (↑/↓) or Numbers (1-N)."""
@@ -754,13 +878,13 @@ def interactive_select(
 
     try:
         with Live(
-            render_interactive_menu(options, selected_idx, title, subtitle),
+            render_interactive_menu(options, selected_idx, title, subtitle, status_line),
             console=console,
             auto_refresh=False,
             transient=True,
         ) as live:
             while True:
-                live.update(render_interactive_menu(options, selected_idx, title, subtitle), refresh=True)
+                live.update(render_interactive_menu(options, selected_idx, title, subtitle, status_line), refresh=True)
                 try:
                     key = _read_raw_key(fd)
                 except (KeyboardInterrupt, EOFError):
@@ -776,7 +900,9 @@ def interactive_select(
                     return options[selected_idx][0]
                 elif key.isdigit():
                     val = int(key)
-                    if 1 <= val <= len(options):
+                    if val == 0 and len(options) >= 10:
+                        return options[9][0]
+                    elif 1 <= val <= len(options):
                         return options[val - 1][0]
     finally:
         # Restore terminal cursor and settings
@@ -788,7 +914,7 @@ def interactive_select(
 
 
 def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Display interactive arrow/number menu to manage running TokenGuard proxy (Claude/Qwen Code style)."""
+    """Display interactive arrow/number menu to manage running TokenGuard proxy (Stripe / GitHub CLI style)."""
     if not sys.stdin.isatty():
         return
 
@@ -827,26 +953,27 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
         except Exception:
             pass
 
-        status_badge = "[bold red]🛑 KILLED[/bold red]" if is_killed else "[bold green]● GUARDING[/bold green]"
-        status_line = f"Status: {status_badge}  •  Profile: [bold cyan]{active_prof}[/bold cyan]  •  Saved: [bold green]+${saved_usd:.2f}[/bold green]  •  Requests: [bold white]{req_count}[/bold white]"
+        status_badge = "[bold red]● KILLED[/bold red]" if is_killed else "[bold green]● GUARDING[/bold green]"
+        status_line = f"Status: {status_badge}  │  Profile: [cyan]{active_prof}[/cyan]  │  Saved: [green]+${saved_usd:.2f}[/green]  │  Reqs: [white]{req_count}[/white]"
 
         menu_options = [
-            ("stream", "📡 Stream Live Activity Monitor", "Real-time requests, tokens & loop breaker logs", "Live"),
-            ("run", "🚀 Run / Wrap Agent Script", "Execute script with TokenGuard proxy injected", ""),
-            ("profile", "🛡️ Switch Guard Profile", "Careful ($5/hr) / Standard ($15/hr) / Passive", ""),
-            ("simulate", "⚡ Run Instant Loop Simulation", "Test circuit breaker tripping (no API key needed)", "Demo"),
-            ("kill", "🛑 Toggle Kill Switch", "Block / Unblock all LLM traffic instantly", ""),
-            ("dashboard", "🌐 Open Web Dashboard", f"http://{host}:{port}", ""),
-            ("clear", "🧹 Clear Logs & Reset Breakers", "Flush request database & loop breaker caches", ""),
-            ("prices", "📊 View Pricing Registry", "Inspect registered model rates ($/1M tokens)", ""),
-            ("stop", "⏹️ Stop TokenGuard Daemon", "Terminate background proxy server", ""),
-            ("exit", "🚪 Exit Menu", "Return to terminal (daemon remains active)", ""),
+            ("stream", "Live Activity Monitor", "Real-time requests & telemetry", "LIVE"),
+            ("run", "Run Protected Script", "Execute script with proxy", ""),
+            ("profile", "Switch Guard Profile", "Careful, Standard, Passive", ""),
+            ("simulate", "Run Loop Simulation", "Test loop circuit breaker", "DEMO"),
+            ("kill", "Toggle Kill Switch", "Block or unblock LLM traffic", ""),
+            ("dashboard", "Open Web Dashboard", f"http://{host}:{port}", ""),
+            ("clear", "Clear Database & Cache", "Reset DB & loop memory", ""),
+            ("prices", "View Model Pricing", "Model rates ($/1M tokens)", ""),
+            ("stop", "Stop Proxy Daemon", "Terminate background proxy", ""),
+            ("exit", "Exit Menu", "Return to terminal shell", ""),
         ]
 
         choice = interactive_select(
             menu_options,
-            title="🛡️ TokenGuard Control Center",
-            subtitle=f"{status_line}\n[dim]Navigate with [bold white]↑/↓[/bold white] arrows or press [bold white]1-9[/bold white], [bold white]Enter[/bold white] to run, [bold white]q[/bold white] to exit[/dim]",
+            title="TokenGuard Control Center",
+            subtitle=f"[dim]↑/↓ arrows or 1-{len(menu_options)} to select · Enter to run · q to exit[/dim]",
+            status_line=status_line,
             default_index=0,
         )
 
@@ -860,7 +987,7 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
                     default="python my_agent.py",
                 ).strip()
                 if cmd_str:
-                    raw_args = cmd_str.split()
+                    raw_args = shlex.split(cmd_str)
                     run_args = argparse.Namespace(
                         cmd=raw_args,
                         host=host,
@@ -877,14 +1004,14 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
                 pass
         elif choice == "profile":
             profile_opts = [
-                ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "Default"),
-                ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "Autonomous"),
-                ("passive", "Passive Monitor", "No loop blocks, tracking only", "Observability"),
+                ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "DEFAULT"),
+                ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "AUTONOMOUS"),
+                ("passive", "Passive Monitor", "No loop blocks, tracking only", "OBSERVABILITY"),
             ]
             prof_choice = interactive_select(
                 profile_opts,
                 title="Choose Guard Profile",
-                subtitle="[dim]Use [bold white]↑/↓[/bold white] arrows or press [bold white]1-3[/bold white], [bold white]Enter[/bold white] to apply[/dim]",
+                subtitle="[dim]↑/↓ arrows or 1-3 to select · Enter to apply · q to exit[/dim]",
                 default_index=0,
             )
             prof_args = argparse.Namespace(name=prof_choice, host=host, port=port)
@@ -898,7 +1025,7 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
                         s_data = sim_res.json()
                         console.print(
                             Panel(
-                                f"[bold green]✓ Simulation Completed[/bold green]\n\n"
+                                f"[bold green]● Simulation Completed[/bold green]\n\n"
                                 f"[dim]Threshold:[/dim] [bold cyan]{s_data.get('threshold')} attempts[/bold cyan]\n"
                                 f"[dim]Loop Intercepted & Blocked with Avoided Cost Calculation.[/dim]\n"
                                 f"[dim]Live event broadcast to Web Dashboard via SSE stream.[/dim]",
@@ -938,14 +1065,14 @@ def cmd_profile(args: argparse.Namespace) -> None:
     name = getattr(args, "name", None)
     if not name:
         profile_opts = [
-            ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "Default"),
-            ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "Autonomous"),
-            ("passive", "Passive Monitor", "No loop blocks, tracking only", "Observability"),
+            ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "DEFAULT"),
+            ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "AUTONOMOUS"),
+            ("passive", "Passive Monitor", "No loop blocks, tracking only", "OBSERVABILITY"),
         ]
         name = interactive_select(
             profile_opts,
             title="Choose Guard Profile",
-            subtitle="[dim]Use [bold white]↑/↓[/bold white] arrows or press [bold white]1-3[/bold white], [bold white]Enter[/bold white] to apply[/dim]",
+            subtitle="[dim]↑/↓ arrows or 1-3 to select · Enter to apply · q to exit[/dim]",
             default_index=0,
         )
 
@@ -1185,25 +1312,32 @@ def cmd_logs(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     """Start the proxy server and dashboard in foreground or daemon mode."""
+    is_passive = getattr(args, "passive", False)
+    limit = 1000.0 if is_passive else args.limit
+    daily_limit = 5000.0 if is_passive else args.daily_limit
+    loop_threshold = 0 if is_passive else args.loop_threshold
+
     if getattr(args, "daemon", False):
         with console.status("[bright_black]Starting TokenGuard daemon in background...[/bright_black]", spinner="dots"):
             pid = start_daemon(
                 host=args.host,
                 port=args.port,
-                limit=args.limit,
-                daily_limit=args.daily_limit,
-                loop_threshold=args.loop_threshold,
+                limit=limit,
+                daily_limit=daily_limit,
+                loop_threshold=loop_threshold,
                 loop_window_seconds=args.loop_window_seconds,
                 upstream_url=args.upstream_url,
                 db_path=args.db_path,
+                passive=is_passive,
             )
 
         if wait_for_server(args.host, args.port, timeout=5.0):
-            table = Table.grid(padding=(0, 2))
-            table.add_column(style="dim", justify="right")
-            table.add_column(style="bright_white")
+            table = Table.grid(padding=(0, 2), expand=False)
+            table.add_column(style="dim", justify="right", no_wrap=True)
+            table.add_column(style="bright_white", no_wrap=True)
 
-            table.add_row("Status:", "[bold green]● ACTIVE & GUARDING[/bold green]")
+            status_text = "[bold yellow]● ACTIVE (PASSIVE MONITOR)[/bold yellow]" if is_passive else "[bold green]● ACTIVE & GUARDING[/bold green]"
+            table.add_row("Status:", status_text)
             table.add_row("Proxy URL:", f"[cyan]http://{args.host}:{args.port}/v1[/cyan]")
             table.add_row("Dashboard:", f"[bold cyan]http://{args.host}:{args.port}[/bold cyan]")
             table.add_row("Process PID:", f"[dim]{pid}[/dim]")
@@ -1215,23 +1349,26 @@ def cmd_start(args: argparse.Namespace) -> None:
                 box=box.ROUNDED,
                 border_style="bright_black",
                 padding=(1, 2),
+                expand=False,
             )
             console.print(panel)
             if sys.stdin.isatty():
                 interactive_control_menu(args.host, args.port)
         else:
-            console.print(f"[yellow]⚠️ TokenGuard daemon spawned (PID: {pid}). Check logs at {LOG_FILE}[/yellow]")
+            console.print(f"[yellow]TokenGuard daemon spawned (PID: {pid}). Check logs at {LOG_FILE}[/yellow]")
         return
 
     settings = Settings(
         host=args.host,
         port=args.port,
-        hourly_limit=args.limit,
-        daily_limit=args.daily_limit,
-        loop_threshold=args.loop_threshold,
+        hourly_limit=limit,
+        daily_limit=daily_limit,
+        loop_threshold=loop_threshold,
         loop_window_seconds=args.loop_window_seconds,
         upstream_url=args.upstream_url,
         db_path=args.db_path,
+        profile="passive" if is_passive else "careful",
+        passive=is_passive,
     )
     set_settings(settings)
 
@@ -1267,12 +1404,17 @@ def cmd_run(args: argparse.Namespace) -> None:
                 title="[bold bright_white]TokenGuard Run[/bold bright_white]",
                 box=box.ROUNDED,
                 border_style="bright_black",
+                expand=False,
             )
         )
         sys.exit(1)
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8080)
+    is_passive = getattr(args, "passive", False)
+    limit = 1000.0 if is_passive else getattr(args, "limit", 5.0)
+    daily_limit = 5000.0 if is_passive else getattr(args, "daily_limit", 50.0)
+    loop_threshold = 0 if is_passive else getattr(args, "loop_threshold", 3)
 
     # 1. Check if TokenGuard proxy is already running; if not, auto-start daemon
     if not is_server_running(host, port):
@@ -1280,16 +1422,17 @@ def cmd_run(args: argparse.Namespace) -> None:
             pid = start_daemon(
                 host=host,
                 port=port,
-                limit=getattr(args, "limit", 5.0),
-                daily_limit=getattr(args, "daily_limit", 50.0),
-                loop_threshold=getattr(args, "loop_threshold", 3),
+                limit=limit,
+                daily_limit=daily_limit,
+                loop_threshold=loop_threshold,
                 loop_window_seconds=getattr(args, "loop_window_seconds", 60.0),
                 upstream_url=getattr(args, "upstream_url", "https://api.openai.com"),
                 db_path=getattr(args, "db_path", Path("tokenguard.db")),
+                passive=is_passive,
             )
 
         if not is_server_running(host, port):
-            err_console.print(f"[bold red]❌ Error: Failed to auto-start TokenGuard proxy. Check {LOG_FILE}[/bold red]")
+            err_console.print(f"[bold red]Error: Failed to auto-start TokenGuard proxy. Check {LOG_FILE}[/bold red]")
             sys.exit(1)
 
         console.print(f"[bold green]●[/bold green] [dim]TokenGuard proxy running (PID: {pid})[/dim]")
@@ -1411,20 +1554,20 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
                     update_stored_config(gemini_api_key=user_key)
                 else:
                     update_stored_config(openai_api_key=user_key)
-                console.print("[dim]✓ Stored in ~/.tokenguard/config.json with restricted permissions (0600)[/dim]")
+                console.print("[dim]Stored in ~/.tokenguard/config.json with restricted permissions (0600)[/dim]")
         except (KeyboardInterrupt, EOFError):
             pass
 
     # 2. Guard Profile Selection via Arrow Keys & Numbers
     profile_opts = [
-        ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "Recommended"),
-        ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "Autonomous"),
-        ("passive", "Passive Monitor", "No loop blocks, tracking & telemetry only", "Observability"),
+        ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "RECOMMENDED"),
+        ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "AUTONOMOUS"),
+        ("passive", "Passive Monitor", "No loop blocks, tracking & telemetry only", "OBSERVABILITY"),
     ]
     selected_profile_key = interactive_select(
         profile_opts,
         title="2. Choose Guard Profile",
-        subtitle="[dim]Use [bold white]↑/↓[/bold white] arrows or press [bold white]1-3[/bold white], [bold white]Enter[/bold white] to confirm[/dim]",
+        subtitle="[dim]↑/↓ arrows or 1-3 to select · Enter to confirm[/dim]",
         default_index=0,
     )
     profile = PROFILES.get(selected_profile_key, PROFILES["careful"])
@@ -1485,36 +1628,150 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
         interactive_control_menu(host, port)
 
 
-def cmd_prices(args: argparse.Namespace) -> None:
-    """Print out registered prices in a clean Rich table."""
-    settings = get_settings()
-    prices_path = args.prices_path or settings.prices_path
-    if not (prices_path and prices_path.exists()):
-        err_console.print(f"[bold red]Error: Prices file not found at {prices_path}[/bold red]")
-        sys.exit(1)
+def _get_provider_label(model_name: str) -> str:
+    """Return a styled provider tag for a given model name."""
+    m = model_name.lower()
+    if "gpt" in m or "o1" in m or "o3" in m or "text-embedding" in m or "dall-e" in m:
+        return "[green]OpenAI[/green]"
+    elif "claude" in m or "anthropic" in m:
+        return "[bright_yellow]Anthropic[/bright_yellow]"
+    elif "gemini" in m or "google" in m or "gemma" in m:
+        return "[bright_blue]Google[/bright_blue]"
+    elif "qwen" in m or "qwq" in m or "dashscope" in m:
+        return "[blue]Alibaba[/blue]"
+    elif "deepseek" in m:
+        return "[cyan]DeepSeek[/cyan]"
+    elif "mistral" in m or "codestral" in m or "pixtral" in m or "ministral" in m:
+        return "[magenta]Mistral[/magenta]"
+    elif "llama" in m or "meta" in m:
+        return "[bright_magenta]Meta[/bright_magenta]"
+    elif "groq" in m:
+        return "[yellow]Groq[/yellow]"
+    return "[dim]Community[/dim]"
 
-    with open(prices_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+
+def cmd_prices(args: argparse.Namespace) -> None:
+    """Print out registered prices with dynamic live registry sync."""
+    do_update = getattr(args, "update", False)
+    do_offline = getattr(args, "offline", False)
+    prices_path = getattr(args, "prices_path", None)
+
+    if do_update:
+        with console.status("[bright_black]Fetching latest live pricing from OpenRouter public registry...[/bright_black]", spinner="dots"):
+            data, was_updated, msg = update_pricing_cache(force=True, baseline_path=prices_path)
+
+        console.print(
+            Panel(
+                f"[bold green]● Pricing Synchronized[/bold green]\n\n"
+                f"[dim]Source:[/dim]  [cyan]OpenRouter Public Registry (openrouter.ai/api/v1/models)[/cyan]\n"
+                f"[dim]Status:[/dim]  {msg}\n"
+                f"[dim]Models:[/dim]  [bold white]{len(data)}[/bold white] models registered",
+                title="[bold bright_white]TokenGuard Dynamic Pricing[/bold bright_white]",
+                box=box.ROUNDED,
+                border_style="bright_black",
+                expand=False,
+            )
+        )
+        source_title = "Live Registry (openrouter.ai)"
+    elif do_offline:
+        data = load_baseline_prices(prices_path)
+        source_title = "Offline Baseline (prices.json)"
+    elif prices_path:
+        data = load_baseline_prices(prices_path)
+        source_title = f"Custom Baseline ({prices_path.name})"
+    else:
+        cached, last_updated = load_cached_prices()
+        if cached:
+            age_hours = round((time.time() - last_updated) / 3600.0, 1) if last_updated > 0 else 0
+            data = get_dynamic_pricing_table()
+            source_title = f"Dynamic Cache ({age_hours}h ago · {len(data)} models)"
+        else:
+            data = get_dynamic_pricing_table()
+            source_title = f"Offline Baseline ({len(data)} models)"
 
     table = Table(
-        title=f"TokenGuard Pricing Registry ({prices_path.name})",
+        title=f"TokenGuard Pricing Registry — {source_title}",
         box=box.ROUNDED,
         border_style="bright_black",
         header_style="bold bright_white",
+        expand=False,
     )
-    table.add_column("Model Name", style="bold cyan")
-    table.add_column("Input Rate ($/1M)", justify="right", style="bright_white")
-    table.add_column("Output Rate ($/1M)", justify="right", style="bright_white")
-    table.add_column("Provider", style="dim")
+    table.add_column("Model Identifier", style="bold cyan", no_wrap=True)
+    table.add_column("Input Rate ($/1M)", justify="right", style="bright_white", no_wrap=True)
+    table.add_column("Output Rate ($/1M)", justify="right", style="bright_white", no_wrap=True)
+    table.add_column("Provider", style="dim", no_wrap=True)
 
-    for model, rates in sorted(data.items()):
-        is_ds = "deepseek" in model.lower()
-        provider = "[cyan]DeepSeek[/cyan]" if is_ds else "[green]OpenAI[/green]"
+    # Filter and sort models: if large dynamic list, prioritize non-namespaced or common models
+    sorted_keys = sorted(data.keys())
+    if len(sorted_keys) > 60 and not do_update:
+        # Show top clean model names
+        display_keys = [k for k in sorted_keys if "/" not in k]
+        if not display_keys:
+            display_keys = sorted_keys[:60]
+    else:
+        display_keys = sorted_keys
+
+    for model in display_keys:
+        rates = data[model]
+        provider = _get_provider_label(model)
         in_cost = f"${float(rates.get('input', 0.0)):.2f}"
         out_cost = f"${float(rates.get('output', 0.0)):.2f}"
         table.add_row(model, in_cost, out_cost, provider)
 
     console.print(table)
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    """Export logged telemetry to JSONL, HAR 1.2, JSON, or CSV format."""
+    db_path = getattr(args, "db_path", Path("tokenguard.db"))
+    format_type = getattr(args, "format", "jsonl")
+    output_path = getattr(args, "output", None)
+    status_filter = getattr(args, "status", "all")
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8080)
+
+    try:
+        target, count, _ = export_telemetry_sync(
+            db_path=db_path,
+            format_type=format_type,
+            output_path=output_path,
+            status_filter=status_filter,
+            host=host,
+            port=port,
+        )
+    except Exception as e:
+        err_console.print(
+            Panel(
+                f"[bold red]Failed to export telemetry:[/bold red] {e}",
+                title="[bold bright_white]TokenGuard Export Error[/bold bright_white]",
+                box=box.ROUNDED,
+                border_style="bright_black",
+                expand=False,
+            )
+        )
+        sys.exit(1)
+
+    table = Table.grid(padding=(0, 2), expand=False)
+    table.add_column(style="dim", justify="right", no_wrap=True)
+    table.add_column(style="bright_white", no_wrap=True)
+
+    table.add_row("Output File:", f"[bold cyan]{target}[/bold cyan]")
+    table.add_row("Format:", f"[bold white]{format_type.upper()}[/bold white]")
+    table.add_row("Filter:", f"[white]{status_filter}[/white]")
+    table.add_row("Total Records:", f"[green]{count}[/green]")
+    table.add_row("Database:", f"[dim]{db_path}[/dim]")
+
+    console.print(
+        Panel(
+            table,
+            title="[bold bright_white]TokenGuard Telemetry Export[/bold bright_white]",
+            subtitle="[dim]Export complete[/dim]",
+            box=box.ROUNDED,
+            border_style="bright_black",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
 
 
 def main() -> None:
@@ -1545,18 +1802,21 @@ def main() -> None:
                 if res.status_code == 200:
                     console.print(
                         Panel(
-                            f"[bold green]✓ Simulation Completed[/bold green]\n\n"
-                            f"[dim]Type:[/dim] {sim_type}  •  [dim]Model:[/dim] {sim_model}\n"
+                            f"[bold green]● Simulation Completed[/bold green]\n\n"
+                            f"[dim]Type:[/dim] {sim_type}  ·  [dim]Model:[/dim] {sim_model}\n"
                             f"[dim]Response:[/dim] {res.json()}",
                             title="[bold bright_white]TokenGuard Simulation[/bold bright_white]",
                             box=box.ROUNDED,
                             border_style="bright_black",
+                            expand=False,
                         )
                     )
                 else:
                     err_console.print(f"[bold red]Simulation failed: {res.text}[/bold red]")
         except Exception as e:
             err_console.print(f"[bold red]Error running simulation: {e}[/bold red]")
+    elif args.command == "export":
+        cmd_export(args)
     elif args.command == "kill":
         cmd_kill(args)
     elif args.command == "resume":

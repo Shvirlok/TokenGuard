@@ -460,4 +460,34 @@ def test_cli_menu_and_simulate_parsers():
     assert parser.parse_args(["simulate", "--type", "loop"]).command == "simulate"
 
 
+def test_cli_passive_flag(monkeypatch):
+    """Verify that --passive is correctly accepted and passed to daemon/settings."""
+    parser = create_parser()
+
+    # Test start with --passive
+    args_start = parser.parse_args(["start", "--passive"])
+    assert args_start.passive is True
+
+    # Test run with --passive
+    args_run = parser.parse_args(["run", "--passive", "python", "script.py"])
+    assert args_run.passive is True
+
+    # Test start_daemon receives passive flag
+    spawned_cmds = []
+    def mock_popen(cmd, *args, **kwargs):
+        spawned_cmds.append(cmd)
+        proc = MagicMock()
+        proc.pid = 99999
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", mock_popen)
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    monkeypatch.setattr(cli_module, "wait_for_server", lambda h, p, timeout: True)
+
+    pid = start_daemon(port=9999, passive=True)
+    assert pid == 99999
+    assert "--passive" in spawned_cmds[0]
+
+
+
 

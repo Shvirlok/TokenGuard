@@ -5,7 +5,6 @@ Demonstrates drop-in replacement with standard OpenAI Python client or HTTP call
 
 from __future__ import annotations
 
-import json
 import time
 import httpx
 

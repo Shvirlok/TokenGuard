@@ -214,12 +214,15 @@ def test_avoided_cost_calculation():
 
 def test_notification_on_loop_block(monkeypatch):
     """Verify that a desktop notification is triggered non-blockingly when a loop is tripped."""
+    import sys
+    import tokenguard.guard
+    guard_mod = sys.modules["tokenguard.guard"]
     notified = []
 
     def mock_send(title, message, sound=True):
         notified.append({"title": title, "message": message})
 
-    monkeypatch.setattr("tokenguard.guard.send_block_notification", mock_send)
+    monkeypatch.setattr(guard_mod, "send_block_notification", mock_send)
 
     guard = CircuitBreaker(loop_threshold=2)
     messages = [{"role": "user", "content": "Loop test prompt"}]
@@ -235,5 +238,29 @@ def test_notification_on_loop_block(monkeypatch):
     assert len(notified) == 1
     assert "Loop" in notified[0]["title"] or "TokenGuard" in notified[0]["title"]
     assert "gpt-4o" in notified[0]["message"]
+
+
+def test_passive_mode_non_blocking():
+    """Verify that passive mode allows infinite repeated requests and exceeds budget without throwing exceptions."""
+    # Guard in passive mode with 0 budget and threshold 2
+    guard = CircuitBreaker(
+        hourly_limit=0.0001,
+        loop_threshold=2,
+        active_profile="passive",
+    )
+    messages = [{"role": "user", "content": "Repeated prompt in passive mode"}]
+
+    # 1st request -> allowed
+    h1 = guard.check_request(messages, "gpt-4o")
+    guard.record_success("gpt-4o", 1000, 500, 0.05, h1)
+
+    # 2nd request (duplicate and exceeding budget) -> still allowed without exception in passive mode
+    h2 = guard.check_request(messages, "gpt-4o")
+    assert h2 == h1
+
+    # 3rd request -> still allowed
+    h3 = guard.check_request(messages, "gpt-4o")
+    assert h3 == h1
+
 
 
