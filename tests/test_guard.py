@@ -7,6 +7,9 @@ from tokenguard.guard import (
     CircuitBreaker,
     KillSwitchActiveError,
     LoopDetectedError,
+    BurnRateExceededError,
+    ContextBallooningError,
+    parse_burn_rate,
 )
 
 
@@ -261,6 +264,112 @@ def test_passive_mode_non_blocking():
     # 3rd request -> still allowed
     h3 = guard.check_request(messages, "gpt-4o")
     assert h3 == h1
+
+
+def test_parse_burn_rate():
+    assert parse_burn_rate("$0.50/min") == (0.50, 60.0)
+    assert parse_burn_rate("$2.00/5m") == (2.00, 300.0)
+    assert parse_burn_rate("1.50/30s") == (1.50, 30.0)
+    assert parse_burn_rate("$10.00/1h") == (10.00, 3600.0)
+    assert parse_burn_rate("$0.25/10sec") == (0.25, 10.0)
+    assert parse_burn_rate("$5/minute") == (5.0, 60.0)
+
+    with pytest.raises(ValueError):
+        parse_burn_rate("invalid")
+    with pytest.raises(ValueError):
+        parse_burn_rate("$0/min")
+
+
+def test_burn_rate_circuit_breaker_tripping():
+    guard = CircuitBreaker(max_burn_rate="$0.50/min")
+    now = time.time()
+    # Add an initial spend within window: $0.35
+    guard.burn_rate_records.append((now - 10, 0.35))
+
+    messages = [{"role": "user", "content": "Hello"}]
+    # Allowed because cumulative spend $0.35 < $0.50
+    guard.check_request(messages, "gpt-4o")
+
+    # Now add another spend of $0.20 -> cumulative spend $0.55 > $0.50
+    guard.burn_rate_records.append((now - 5, 0.20))
+
+    with pytest.raises(BurnRateExceededError) as exc_info:
+        guard.check_request(messages, "gpt-4o")
+
+    err = exc_info.value
+    assert err.error_type == "tokenguard_budget_breach"
+    assert err.code == "burn_rate_exceeded"
+    assert err.budget_limit == 0.50
+    assert err.current_spend == pytest.approx(0.55, 1e-4)
+
+    payload = err.to_dict()
+    assert payload["error"]["type"] == "tokenguard_budget_breach"
+    assert payload["error"]["code"] == "burn_rate_exceeded"
+    assert payload["error"]["budget_limit"] == 0.50
+    assert payload["error"]["current_spend"] == pytest.approx(0.55, 1e-4)
+    assert "Burn rate exceeded" in payload["error"]["message"]
+    assert "Hard limit: $0.50/min" in payload["error"]["message"]
+
+
+def test_burn_rate_sliding_window_expiration():
+    guard = CircuitBreaker(max_burn_rate="$0.50/min")
+    now = time.time()
+    # Spend of $0.60 happened 70 seconds ago (outside 60s window)
+    guard.burn_rate_records.append((now - 70, 0.60))
+
+    messages = [{"role": "user", "content": "Hello after window"}]
+    # Should be allowed because old spend expired from sliding window
+    guard.check_request(messages, "gpt-4o")
+
+
+def test_context_ballooning_tripping():
+    guard = CircuitBreaker(enable_context_ballooning=True)
+    session_id = "agent-session-42"
+
+    # Request 1: 100 prompt tokens
+    msg1 = [{"role": "user", "content": "Initial prompt specification"}]
+    guard.check_request(msg1, "gpt-4o", session_id=session_id, incoming_tokens=100)
+    guard.record_success("gpt-4o", prompt_tokens=100, completion_tokens=20, cost=0.001, session_id=session_id)
+
+    # Request 2: 250 prompt tokens (> 100)
+    msg2 = [{"role": "user", "content": "Initial prompt plus compiler error 1 and stack trace"}]
+    guard.check_request(msg2, "gpt-4o", session_id=session_id, incoming_tokens=250)
+    guard.record_success("gpt-4o", prompt_tokens=250, completion_tokens=20, cost=0.002, session_id=session_id)
+
+    # Request 3: 450 prompt tokens (> 100 * 3.0 = 300, consecutive expansion > 300%)
+    msg3 = [{"role": "user", "content": "Initial prompt plus compiler errors and intermediate thoughts"}]
+    with pytest.raises(ContextBallooningError) as exc_info:
+        guard.check_request(msg3, "gpt-4o", session_id=session_id, incoming_tokens=450)
+
+    err = exc_info.value
+    assert err.error_type == "tokenguard_budget_breach"
+    assert err.code == "context_ballooning_detected"
+    payload = err.to_dict()
+    assert payload["error"]["code"] == "context_ballooning_detected"
+    assert "Context ballooning detected" in payload["error"]["message"]
+
+
+def test_context_ballooning_bypass_with_task_or_cache():
+    guard = CircuitBreaker(enable_context_ballooning=True)
+    session_id = "agent-session-bypass"
+
+    # Request 1: 100 tokens
+    msg1 = [{"role": "user", "content": "Step 1 instruction"}]
+    guard.check_request(msg1, "gpt-4o", session_id=session_id, incoming_tokens=100)
+    guard.record_success("gpt-4o", prompt_tokens=100, completion_tokens=20, cost=0.001, session_id=session_id)
+
+    # Request 2: 250 tokens
+    msg2 = [{"role": "user", "content": "Step 2 instruction with stack trace"}]
+    guard.check_request(msg2, "gpt-4o", session_id=session_id, incoming_tokens=250)
+    guard.record_success("gpt-4o", prompt_tokens=250, completion_tokens=20, cost=0.002, session_id=session_id)
+
+    # Request 3: 500 tokens (> 300%), BUT has_task_update=True
+    msg3 = [{"role": "user", "content": "Step 3 instruction with large context"}]
+    guard.check_request(msg3, "gpt-4o", session_id=session_id, incoming_tokens=500, has_task_update=True)
+
+    # Separate session ID should also not trip
+    guard.check_request(msg3, "gpt-4o", session_id="different-session", incoming_tokens=500)
+
 
 
 

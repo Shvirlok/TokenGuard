@@ -93,6 +93,12 @@ def create_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--limit", type=float, default=5.0, help="Sliding hourly budget limit in USD (default: 5.0)")
     run_parser.add_argument("--daily-limit", type=float, default=50.0, help="Sliding daily budget limit in USD (default: 50.0)")
     run_parser.add_argument(
+        "--max-burn-rate",
+        type=str,
+        default=None,
+        help="Maximum spending burn rate velocity limit (e.g. '$0.50/min', '$2.00/5m')",
+    )
+    run_parser.add_argument(
         "--passive",
         action="store_true",
         help="Run in passive observability mode (no loop or budget cutoffs)",
@@ -290,6 +296,12 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         help="Sliding daily budget limit in USD (default: 50.0)",
     )
     p.add_argument(
+        "--max-burn-rate",
+        type=str,
+        default=None,
+        help="Maximum spending burn rate velocity limit (e.g. '$0.50/min', '$2.00/5m')",
+    )
+    p.add_argument(
         "--passive",
         action="store_true",
         help="Run in passive observability mode (no loop or budget cutoffs)",
@@ -327,7 +339,7 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def print_banner(host: str, port: int, limit: float, loop_threshold: int) -> None:
+def print_banner(host: str, port: int, limit: float, loop_threshold: int, max_burn_rate: Optional[str] = None) -> None:
     """Display the clean Rich TokenGuard terminal startup banner."""
     base_url = f"http://{host}:{port}"
     loop_str = f"Enabled [dim](cutoff: {loop_threshold})[/dim]" if loop_threshold > 0 else "[yellow]Disabled (Passive)[/yellow]"
@@ -339,6 +351,8 @@ def print_banner(host: str, port: int, limit: float, loop_threshold: int) -> Non
     table.add_row("Proxy Base URL:", f"[cyan]{base_url}/v1[/cyan]")
     table.add_row("Web Dashboard:", f"[bold cyan]{base_url}[/bold cyan]")
     table.add_row("Hourly Limit:", f"[bold white]${limit:.2f}/hr[/bold white]")
+    if max_burn_rate:
+        table.add_row("Burn Rate Limit:", f"[bold white]{max_burn_rate}[/bold white]")
     table.add_row("Loop Breaker:", loop_str)
 
     panel = Panel(
@@ -409,6 +423,7 @@ def start_daemon(
     upstream_url: str = "https://api.openai.com",
     db_path: Path = Path("tokenguard.db"),
     passive: bool = False,
+    max_burn_rate: Optional[str] = None,
 ) -> int:
     """Spawn TokenGuard proxy in background as a daemon process."""
     existing_pid = get_daemon_pid()
@@ -441,6 +456,8 @@ def start_daemon(
     ]
     if passive:
         cmd.append("--passive")
+    if max_burn_rate:
+        cmd.extend(["--max-burn-rate", str(max_burn_rate)])
 
     log_file = open(LOG_FILE, "a", encoding="utf-8")
     proc = subprocess.Popen(
@@ -932,7 +949,14 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
                 )
             )
             settings = get_settings()
-            pid = start_daemon(host=host, port=port, limit=settings.hourly_limit, loop_threshold=settings.loop_threshold)
+            pid = start_daemon(
+                host=host,
+                port=port,
+                limit=settings.hourly_limit,
+                daily_limit=settings.daily_limit,
+                loop_threshold=settings.loop_threshold,
+                max_burn_rate=settings.max_burn_rate,
+            )
             time.sleep(0.5)
 
         # Query live stats from daemon
@@ -1329,6 +1353,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 upstream_url=args.upstream_url,
                 db_path=args.db_path,
                 passive=is_passive,
+                max_burn_rate=getattr(args, "max_burn_rate", None),
             )
 
         if wait_for_server(args.host, args.port, timeout=5.0):
@@ -1363,6 +1388,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         port=args.port,
         hourly_limit=limit,
         daily_limit=daily_limit,
+        max_burn_rate=getattr(args, "max_burn_rate", None),
         loop_threshold=loop_threshold,
         loop_window_seconds=args.loop_window_seconds,
         upstream_url=args.upstream_url,
@@ -1377,6 +1403,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         port=settings.port,
         limit=settings.hourly_limit,
         loop_threshold=settings.loop_threshold,
+        max_burn_rate=settings.max_burn_rate,
     )
 
     uvicorn.run(
@@ -1429,6 +1456,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 upstream_url=getattr(args, "upstream_url", "https://api.openai.com"),
                 db_path=getattr(args, "db_path", Path("tokenguard.db")),
                 passive=is_passive,
+                max_burn_rate=getattr(args, "max_burn_rate", None),
             )
 
         if not is_server_running(host, port):

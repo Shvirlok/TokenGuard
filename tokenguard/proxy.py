@@ -23,6 +23,7 @@ from tokenguard.db import (
     get_hourly_history,
     get_metrics,
     get_recent_requests,
+    get_recent_spends,
     init_db,
     log_request,
 )
@@ -34,13 +35,215 @@ from tokenguard.export import (
 )
 from tokenguard.guard import (
     BudgetExceededError,
+    BurnRateExceededError,
     CircuitBreaker,
     CircuitBreakerError,
+    ContextBallooningError,
     KillSwitchActiveError,
     LoopDetectedError,
+    parse_burn_rate,
 )
 
 logger = logging.getLogger("tokenguard.proxy")
+
+
+class StreamAccumulator:
+    """Lightweight background character/token accumulator for SSE streams.
+
+    Processes SSE chunks asynchronously in a background task without blocking
+    the pass-through streaming loop. Extracts native provider usage blocks
+    if available (OpenAI stream_options include_usage, Anthropic message_start/message_delta),
+    or accumulates characters and estimates tokens if native usage is omitted.
+    """
+
+    def __init__(self, is_anthropic: bool = False, prompt_tokens_estimate: int = 0):
+        self.is_anthropic = is_anthropic
+        self.prompt_tokens_estimate = prompt_tokens_estimate
+        self.prompt_tokens: Optional[int] = None
+        self.completion_tokens: Optional[int] = None
+        self.accumulated_chars: int = 0
+        self.accumulated_tokens: int = 0
+        self.usage_found: bool = False
+        self._queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=2000)
+        self._task: Optional[asyncio.Task] = None
+        self._buffer: str = ""
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._process_queue())
+
+    def feed(self, chunk: bytes) -> None:
+        """Non-blocking chunk ingestion into background queue."""
+        try:
+            self._queue.put_nowait(chunk)
+        except (asyncio.QueueFull, Exception):
+            pass
+
+    async def _process_queue(self) -> None:
+        try:
+            while True:
+                chunk = await self._queue.get()
+                if chunk is None:
+                    break
+
+                try:
+                    text = chunk.decode("utf-8", errors="ignore")
+                    self._buffer += text
+
+                    while "\n" in self._buffer:
+                        line, self._buffer = self._buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+
+                        self._process_line(data_str)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    def _process_line(self, data_str: str) -> None:
+        try:
+            if not (data_str.startswith("{") and data_str.endswith("}")):
+                return
+
+            payload = json.loads(data_str)
+            if self.is_anthropic:
+                self._process_anthropic_payload(payload)
+            else:
+                self._process_openai_payload(payload)
+        except Exception:
+            pass
+
+    def _process_openai_payload(self, payload: Dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        if usage and isinstance(usage, dict):
+            p_tok = usage.get("prompt_tokens")
+            c_tok = usage.get("completion_tokens")
+            if p_tok is not None:
+                self.prompt_tokens = int(p_tok)
+            if c_tok is not None:
+                self.completion_tokens = int(c_tok)
+            self.usage_found = True
+
+        choices = payload.get("choices")
+        if choices and isinstance(choices, list):
+            for choice in choices:
+                delta = choice.get("delta")
+                if delta and isinstance(delta, dict):
+                    content = delta.get("content")
+                    if content and isinstance(content, str):
+                        self.accumulated_chars += len(content)
+                        self.accumulated_tokens += max(1, len(content) // 4)
+
+    def _process_anthropic_payload(self, payload: Dict[str, Any]) -> None:
+        ptype = payload.get("type")
+        if ptype == "message_start":
+            msg = payload.get("message", {})
+            u = msg.get("usage", {})
+            if "input_tokens" in u:
+                self.prompt_tokens = int(u["input_tokens"])
+                self.usage_found = True
+        elif ptype == "message_delta":
+            u = payload.get("usage", {})
+            if "output_tokens" in u:
+                self.completion_tokens = int(u["output_tokens"])
+                self.usage_found = True
+        elif ptype == "content_block_delta":
+            delta = payload.get("delta", {})
+            text = delta.get("text", "")
+            if text:
+                self.accumulated_chars += len(text)
+                self.accumulated_tokens += max(1, len(text) // 4)
+
+    async def finish(self) -> Tuple[int, int]:
+        """Signal end of stream and return (prompt_tokens, completion_tokens)."""
+        try:
+            self._queue.put_nowait(None)
+        except Exception:
+            pass
+
+        if self._task and not self._task.done():
+            try:
+                await asyncio.wait_for(self._task, timeout=0.5)
+            except Exception:
+                if not self._task.done():
+                    self._task.cancel()
+
+        if self.prompt_tokens is not None and self.prompt_tokens > 0:
+            final_prompt = self.prompt_tokens
+        else:
+            final_prompt = self.prompt_tokens_estimate
+
+        if self.completion_tokens is not None and self.completion_tokens > 0:
+            final_completion = self.completion_tokens
+        elif self.accumulated_tokens > 0:
+            final_completion = self.accumulated_tokens
+        elif self.accumulated_chars > 0:
+            final_completion = max(1, self.accumulated_chars // 4)
+        else:
+            final_completion = 1
+
+        return final_prompt, final_completion
+
+
+def _detect_task_update(
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+    messages: Any,
+) -> bool:
+    """Detect if request contains an explicit task status update."""
+    for h in ("x-task-status", "x-status-update", "x-task-state", "x-task-complete"):
+        if h in headers and headers[h]:
+            return True
+
+    for f in ("task_status", "status_update", "task_state", "status"):
+        if body.get(f):
+            return True
+
+    if isinstance(messages, list):
+        for msg in reversed(messages[-3:]):
+            if isinstance(msg, dict):
+                content = str(msg.get("content", "")).lower()
+                if any(k in content for k in (
+                    "task_status",
+                    "status: complete",
+                    "status: done",
+                    "status: in_progress",
+                    "status: update",
+                    "[task_update]",
+                    "[status_update]",
+                    "task status:",
+                )):
+                    return True
+                tool_calls = msg.get("tool_calls", [])
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        fn = tc.get("function", {}).get("name", "").lower()
+                        if any(k in fn for k in ("task_update", "update_task", "set_status", "complete_task")):
+                            return True
+    return False
+
+
+def _detect_cache_hit(
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+) -> bool:
+    """Detect if request is marked as a prompt cache hit."""
+    for h in ("x-cache-hit", "x-prompt-cache-hit", "x-cache"):
+        val = str(headers.get(h, "")).lower()
+        if val in ("true", "1", "hit"):
+            return True
+
+    if body.get("cache_hit") is True or body.get("prompt_cache_hit", False):
+        return True
+    if int(body.get("prompt_cache_hit_tokens", 0) or 0) > 0:
+        return True
+
+    return False
 
 
 class EventBroadcaster:
@@ -79,6 +282,38 @@ circuit_breaker: Optional[CircuitBreaker] = None
 http_client: Optional[httpx.AsyncClient] = None
 
 
+def get_guard() -> CircuitBreaker:
+    """Return active CircuitBreaker instance, initializing a default if not yet created."""
+    global circuit_breaker
+    if circuit_breaker is None:
+        settings = get_settings()
+        circuit_breaker = CircuitBreaker(
+            hourly_limit=settings.hourly_limit,
+            daily_limit=settings.daily_limit,
+            loop_threshold=settings.loop_threshold,
+            loop_window_size=settings.loop_window_size,
+            loop_window_seconds=settings.loop_window_seconds,
+            prices_path=settings.prices_path,
+            kill_switch=settings.kill_switch,
+            active_profile=settings.profile,
+            max_burn_rate=settings.max_burn_rate,
+            enable_context_ballooning=settings.enable_context_ballooning,
+        )
+    return circuit_breaker
+
+
+def get_client() -> httpx.AsyncClient:
+    """Return active httpx.AsyncClient instance."""
+    global http_client
+    if http_client is None:
+        settings = get_settings()
+        http_client = httpx.AsyncClient(
+            base_url=settings.upstream_url,
+            timeout=httpx.Timeout(settings.timeout, connect=10.0),
+        )
+    return http_client
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for setup and teardown."""
@@ -88,7 +323,7 @@ async def lifespan(app: FastAPI):
     # Initialize SQLite database
     await init_db(settings.db_path)
 
-    # Initialize CircuitBreaker engine
+    # Initialize CircuitBreaker engine with burn rate and context ballooning guard
     circuit_breaker = CircuitBreaker(
         hourly_limit=settings.hourly_limit,
         daily_limit=settings.daily_limit,
@@ -98,7 +333,13 @@ async def lifespan(app: FastAPI):
         prices_path=settings.prices_path,
         kill_switch=settings.kill_switch,
         active_profile=settings.profile,
+        max_burn_rate=settings.max_burn_rate,
+        enable_context_ballooning=settings.enable_context_ballooning,
     )
+
+    # Seed recent spends from SQLite to back sliding window burn-rate engine
+    recent_spends = await get_recent_spends(settings.db_path, hours=24.0)
+    circuit_breaker.seed_initial_spends(recent_spends)
 
     # Persistent HTTP client for upstream proxying
     http_client = httpx.AsyncClient(
@@ -513,6 +754,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         daily_limit = payload.get("daily_limit")
         loop_threshold = payload.get("loop_threshold")
         profile = payload.get("profile")
+        max_burn_rate = payload.get("max_burn_rate")
+        enable_context_ballooning = payload.get("enable_context_ballooning")
         source = payload.get("source", "web")
 
         circuit_breaker.update_limits(
@@ -520,6 +763,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             daily_limit=daily_limit,
             loop_threshold=loop_threshold,
             profile=profile,
+            max_burn_rate=max_burn_rate,
+            enable_context_ballooning=enable_context_ballooning,
         )
 
         action_text = f"Profile set to {str(profile).capitalize()}" if profile else "Limits updated"
@@ -755,12 +1000,31 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         is_streaming = bool(body.get("stream", False))
         prompt_hash = circuit_breaker.compute_prompt_hash(check_payload)
 
+        session_id = (
+            request.headers.get("x-session-id")
+            or request.headers.get("session-id")
+            or (body.get("metadata", {}).get("user_id") if isinstance(body.get("metadata"), dict) else None)
+            or "default"
+        )
+        has_task_update = _detect_task_update(request.headers, body, check_payload)
+        cache_hit = _detect_cache_hit(request.headers, body)
+
         # 2. Pre-flight Circuit Breaker Guards
         try:
-            circuit_breaker.check_request(check_payload, model)
+            circuit_breaker.check_request(
+                check_payload,
+                model,
+                session_id=session_id,
+                has_task_update=has_task_update,
+                cache_hit=cache_hit,
+            )
         except CircuitBreakerError as cb_err:
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if cb_err.error_type == "budget_exceeded":
+            if getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+                status_tag = "blocked_burn_rate"
+            elif getattr(cb_err, "code", None) == "context_ballooning_detected":
+                status_tag = "blocked_context_ballooning"
+            elif cb_err.error_type == "budget_exceeded":
                 status_tag = "blocked_budget"
             elif cb_err.error_type == "loop_detected":
                 status_tag = "blocked_loop"
@@ -815,6 +1079,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 circuit_breaker=circuit_breaker,
                 db_path=current_settings.db_path,
                 messages=check_payload,
+                session_id=session_id,
             )
 
         return await _handle_anthropic_non_streaming(
@@ -827,6 +1092,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             circuit_breaker=circuit_breaker,
             db_path=current_settings.db_path,
             messages=check_payload,
+            session_id=session_id,
         )
 
     # --------------------------------------------------------------------------
@@ -857,12 +1123,31 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         is_streaming = bool(body.get("stream", False))
         prompt_hash = circuit_breaker.compute_prompt_hash(messages)
 
+        session_id = (
+            request.headers.get("x-session-id")
+            or request.headers.get("session-id")
+            or body.get("user")
+            or "default"
+        )
+        has_task_update = _detect_task_update(request.headers, body, messages)
+        cache_hit = _detect_cache_hit(request.headers, body)
+
         # 2. Pre-flight Circuit Breaker Guards
         try:
-            circuit_breaker.check_request(messages, model)
+            circuit_breaker.check_request(
+                messages,
+                model,
+                session_id=session_id,
+                has_task_update=has_task_update,
+                cache_hit=cache_hit,
+            )
         except CircuitBreakerError as cb_err:
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if cb_err.error_type == "budget_exceeded":
+            if getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+                status_tag = "blocked_burn_rate"
+            elif getattr(cb_err, "code", None) == "context_ballooning_detected":
+                status_tag = "blocked_context_ballooning"
+            elif cb_err.error_type == "budget_exceeded":
                 status_tag = "blocked_budget"
             elif cb_err.error_type == "loop_detected":
                 status_tag = "blocked_loop"
@@ -904,6 +1189,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     db_path=current_settings.db_path,
                     messages=messages,
                     authorization=authorization,
+                    session_id=session_id,
                 )
 
         # Standard OpenAI-compatible upstream routing (OpenAI, Gemini, Qwen/DashScope, DeepSeek, Groq, Mistral, OpenRouter)
@@ -933,6 +1219,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 circuit_breaker=circuit_breaker,
                 db_path=current_settings.db_path,
                 messages=messages,
+                session_id=session_id,
             )
 
         return await _handle_non_streaming_chat(
@@ -945,6 +1232,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             circuit_breaker=circuit_breaker,
             db_path=current_settings.db_path,
             messages=messages,
+            session_id=session_id,
         )
 
     # --------------------------------------------------------------------------
@@ -1026,6 +1314,7 @@ async def _handle_anthropic_non_streaming(
     circuit_breaker: CircuitBreaker,
     db_path: Path,
     messages: Any,
+    session_id: Optional[str] = "default",
 ) -> Response:
     """Execute non-streaming request against Anthropic Messages API."""
     start_time = time.perf_counter()
@@ -1034,6 +1323,8 @@ async def _handle_anthropic_non_streaming(
     except Exception as exc:
         logger.error(f"Anthropic upstream request failed: {exc}")
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return JSONResponse(
             status_code=502,
             content={"type": "error", "error": {"type": "api_error", "message": f"TokenGuard upstream error: {str(exc)}"}},
@@ -1042,6 +1333,8 @@ async def _handle_anthropic_non_streaming(
     latency_ms = int((time.perf_counter() - start_time) * 1000)
     if upstream_resp.status_code != 200:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1052,6 +1345,8 @@ async def _handle_anthropic_non_streaming(
         resp_data = upstream_resp.json()
     except Exception:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers={"Content-Type": "application/json"})
 
     usage = resp_data.get("usage") or {}
@@ -1059,7 +1354,7 @@ async def _handle_anthropic_non_streaming(
     completion_tokens = int(usage.get("output_tokens") or 0)
 
     cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
 
     await _record_and_broadcast_request(
         db_path=db_path,
@@ -1085,14 +1380,17 @@ async def _handle_anthropic_streaming(
     circuit_breaker: CircuitBreaker,
     db_path: Path,
     messages: Any,
+    session_id: Optional[str] = "default",
 ) -> StreamingResponse:
-    """Handle streaming SSE completions from Anthropic Messages API."""
+    """Handle streaming SSE completions from Anthropic Messages API with pass-through zero-latency chunk forwarding."""
     start_time = time.perf_counter()
     try:
         upstream_req = http_client.build_request("POST", target_url, json=body, headers=headers)
         upstream_resp = await http_client.send(upstream_req, stream=True)
     except Exception as exc:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return JSONResponse(
             status_code=502,
             content={"type": "error", "error": {"type": "api_error", "message": f"TokenGuard upstream error: {str(exc)}"}},
@@ -1100,75 +1398,67 @@ async def _handle_anthropic_streaming(
 
     if upstream_resp.status_code != 200:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         error_content = await upstream_resp.aread()
         await upstream_resp.aclose()
         return Response(content=error_content, status_code=upstream_resp.status_code, headers={"Content-Type": "application/json"})
 
     async def anthropic_sse_generator() -> AsyncGenerator[bytes, None]:
-        buffer = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        usage_found = False
+        prompt_est = circuit_breaker.estimate_prompt_tokens(messages)
+        accumulator = StreamAccumulator(is_anthropic=True, prompt_tokens_estimate=prompt_est)
+        accumulator.start()
+        is_cancelled = False
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
+                # Immediately yield chunk to downstream client (< 5ms latency overhead)
                 yield chunk
-                try:
-                    text_chunk = chunk.decode("utf-8", errors="ignore")
-                    buffer += text_chunk
-
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-
-                        data_str = line[5:].strip()
-                        if not data_str:
-                            continue
-
-                        try:
-                            payload = json.loads(data_str)
-                            ptype = payload.get("type")
-                            if ptype == "message_start":
-                                msg = payload.get("message", {})
-                                u = msg.get("usage", {})
-                                if "input_tokens" in u:
-                                    prompt_tokens = int(u["input_tokens"])
-                                    usage_found = True
-                            elif ptype == "message_delta":
-                                u = payload.get("usage", {})
-                                if "output_tokens" in u:
-                                    completion_tokens = int(u["output_tokens"])
-                                    usage_found = True
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                # Non-blocking feed to background token accumulator
+                accumulator.feed(chunk)
+        except (asyncio.CancelledError, GeneratorExit):
+            is_cancelled = True
+            logger.info("Client disconnected / cancelled during Anthropic SSE streaming")
+            raise
+        except Exception as exc:
+            logger.error(f"Error during Anthropic stream: {exc}")
+            raise
         finally:
-            await upstream_resp.aclose()
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            # Guarantee upstream socket is closed immediately
+            try:
+                await upstream_resp.aclose()
+            except Exception as e:
+                logger.debug(f"Error closing upstream response: {e}")
 
-            if not usage_found or (prompt_tokens == 0 and completion_tokens == 0):
-                prompt_tokens = circuit_breaker.estimate_prompt_tokens(messages)
-                completion_tokens = max(1, completion_tokens)
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            prompt_tokens, completion_tokens = await accumulator.finish()
 
             cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-            circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+            circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
+
+            req_status = "cancelled" if is_cancelled else "success"
+            blocked_reason = "Client disconnected / stream cancelled" if is_cancelled else None
+
+            async def _finalize_record():
+                try:
+                    await _record_and_broadcast_request(
+                        db_path=db_path,
+                        model=model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cost_usd=cost_usd,
+                        latency_ms=latency_ms,
+                        prompt_hash=prompt_hash,
+                        status=req_status,
+                        blocked_reason=blocked_reason,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to log Anthropic stream: {e}")
 
             try:
-                await _record_and_broadcast_request(
-                    db_path=db_path,
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    cost_usd=cost_usd,
-                    latency_ms=latency_ms,
-                    prompt_hash=prompt_hash,
-                    status="success",
-                )
-            except Exception as e:
-                logger.error(f"Failed to log Anthropic stream: {e}")
+                await asyncio.shield(_finalize_record())
+            except Exception:
+                pass
 
     return StreamingResponse(
         anthropic_sse_generator(),
@@ -1190,6 +1480,7 @@ async def _handle_openai_to_anthropic_adapter(
     db_path: Path,
     messages: List[Dict[str, Any]],
     authorization: Optional[str] = None,
+    session_id: Optional[str] = "default",
 ) -> Response:
     """Translate OpenAI chat completion request to Anthropic Messages API and adapt response back."""
     target_url = resolve_upstream_url("anthropic", endpoint="messages")
@@ -1223,17 +1514,20 @@ async def _handle_openai_to_anthropic_adapter(
     anthropic_payload["stream"] = is_streaming
 
     if is_streaming:
-        # Stream Anthropic deltas translated into OpenAI chunks
         start_time = time.perf_counter()
         try:
             req = http_client.build_request("POST", target_url, json=anthropic_payload, headers=forward_headers)
             upstream_resp = await http_client.send(req, stream=True)
         except Exception as exc:
             circuit_breaker.remove_last_hash(prompt_hash)
+            if session_id:
+                circuit_breaker.remove_last_session_entry(session_id)
             return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "bad_gateway"}})
 
         if upstream_resp.status_code != 200:
             circuit_breaker.remove_last_hash(prompt_hash)
+            if session_id:
+                circuit_breaker.remove_last_session_entry(session_id)
             err_bytes = await upstream_resp.aread()
             await upstream_resp.aclose()
             return Response(content=err_bytes, status_code=upstream_resp.status_code, headers={"Content-Type": "application/json"})
@@ -1243,6 +1537,7 @@ async def _handle_openai_to_anthropic_adapter(
             prompt_tokens = 0
             completion_tokens = 0
             chunk_id = f"chatcmpl-claude-{int(time.time())}"
+            is_cancelled = False
 
             try:
                 async for chunk in upstream_resp.aiter_bytes():
@@ -1296,9 +1591,15 @@ async def _handle_openai_to_anthropic_adapter(
                 }
                 yield f"data: {json.dumps(stop_chunk)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
-
+            except (asyncio.CancelledError, GeneratorExit):
+                is_cancelled = True
+                raise
             finally:
-                await upstream_resp.aclose()
+                try:
+                    await upstream_resp.aclose()
+                except Exception as e:
+                    logger.debug(f"Error closing upstream Claude stream: {e}")
+
                 latency_ms = int((time.perf_counter() - start_time) * 1000)
                 if prompt_tokens == 0:
                     prompt_tokens = circuit_breaker.estimate_prompt_tokens(messages)
@@ -1306,21 +1607,27 @@ async def _handle_openai_to_anthropic_adapter(
                     completion_tokens = 50
 
                 cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-                circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+                circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
+
+                async def _finalize():
+                    try:
+                        await _record_and_broadcast_request(
+                            db_path=db_path,
+                            model=model,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            cost_usd=cost_usd,
+                            latency_ms=latency_ms,
+                            prompt_hash=prompt_hash,
+                            status="cancelled" if is_cancelled else "success",
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to record adapted Claude stream: {e}")
 
                 try:
-                    await _record_and_broadcast_request(
-                        db_path=db_path,
-                        model=model,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        cost_usd=cost_usd,
-                        latency_ms=latency_ms,
-                        prompt_hash=prompt_hash,
-                        status="success",
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to record adapted Claude stream: {e}")
+                    await asyncio.shield(_finalize())
+                except Exception:
+                    pass
 
         return StreamingResponse(
             adapted_stream_generator(),
@@ -1334,17 +1641,23 @@ async def _handle_openai_to_anthropic_adapter(
         resp = await http_client.post(target_url, json=anthropic_payload, headers=forward_headers)
     except Exception as exc:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "bad_gateway"}})
 
     latency_ms = int((time.perf_counter() - start_time) * 1000)
     if resp.status_code != 200:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(content=resp.content, status_code=resp.status_code, headers={"Content-Type": "application/json"})
 
     try:
         data = resp.json()
     except Exception:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(content=resp.content, status_code=resp.status_code, headers={"Content-Type": "application/json"})
 
     # Extract text from Anthropic content blocks
@@ -1358,7 +1671,7 @@ async def _handle_openai_to_anthropic_adapter(
     completion_tokens = int(usage.get("output_tokens") or 0)
 
     cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
 
     await _record_and_broadcast_request(
         db_path=db_path,
@@ -1406,6 +1719,7 @@ async def _handle_non_streaming_chat(
     circuit_breaker: CircuitBreaker,
     db_path: Path,
     messages: Any,
+    session_id: Optional[str] = "default",
 ) -> Response:
     """Execute standard non-streaming chat completions upstream request."""
     start_time = time.perf_counter()
@@ -1419,6 +1733,8 @@ async def _handle_non_streaming_chat(
     except Exception as exc:
         logger.error(f"Upstream request failed: {exc}")
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return JSONResponse(
             status_code=502,
             content={"error": {"message": f"TokenGuard upstream error: {str(exc)}", "type": "bad_gateway"}},
@@ -1428,6 +1744,8 @@ async def _handle_non_streaming_chat(
 
     if upstream_resp.status_code != 200:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1438,6 +1756,8 @@ async def _handle_non_streaming_chat(
         resp_data = upstream_resp.json()
     except Exception:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1453,7 +1773,7 @@ async def _handle_non_streaming_chat(
     completion_tokens = int(usage.get("completion_tokens") or 0)
 
     cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+    circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
 
     await _record_and_broadcast_request(
         db_path=db_path,
@@ -1484,8 +1804,9 @@ async def _handle_streaming_chat(
     circuit_breaker: CircuitBreaker,
     db_path: Path,
     messages: Any,
+    session_id: Optional[str] = "default",
 ) -> StreamingResponse:
-    """Handle streaming SSE completions with on-the-fly token usage extraction."""
+    """Handle streaming SSE completions with pass-through zero-latency chunk forwarding."""
     start_time = time.perf_counter()
 
     try:
@@ -1499,6 +1820,8 @@ async def _handle_streaming_chat(
     except Exception as exc:
         logger.error(f"Failed to initiate upstream stream: {exc}")
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         return JSONResponse(
             status_code=502,
             content={"error": {"message": f"TokenGuard upstream error: {str(exc)}", "type": "bad_gateway"}},
@@ -1506,6 +1829,8 @@ async def _handle_streaming_chat(
 
     if upstream_resp.status_code != 200:
         circuit_breaker.remove_last_hash(prompt_hash)
+        if session_id:
+            circuit_breaker.remove_last_session_entry(session_id)
         error_content = await upstream_resp.aread()
         await upstream_resp.aclose()
         return Response(
@@ -1515,71 +1840,67 @@ async def _handle_streaming_chat(
         )
 
     async def sse_generator() -> AsyncGenerator[bytes, None]:
-        buffer = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        usage_found = False
+        prompt_est = circuit_breaker.estimate_prompt_tokens(messages)
+        accumulator = StreamAccumulator(is_anthropic=False, prompt_tokens_estimate=prompt_est)
+        accumulator.start()
+        is_cancelled = False
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
+                # Immediately yield incoming chunk to downstream client (< 5ms latency overhead)
                 yield chunk
-
-                try:
-                    text_chunk = chunk.decode("utf-8", errors="ignore")
-                    buffer += text_chunk
-
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            continue
-
-                        if '"usage"' in data_str:
-                            try:
-                                payload = json.loads(data_str)
-                                usage = payload.get("usage")
-                                if usage and isinstance(usage, dict):
-                                    p_tok = usage.get("prompt_tokens")
-                                    c_tok = usage.get("completion_tokens")
-                                    if p_tok is not None:
-                                        prompt_tokens = int(p_tok)
-                                    if c_tok is not None:
-                                        completion_tokens = int(c_tok)
-                                    usage_found = True
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
+                # Non-blocking feed to background token accumulator without blocking generator loop
+                accumulator.feed(chunk)
+        except (asyncio.CancelledError, GeneratorExit):
+            is_cancelled = True
+            logger.info("Client disconnected / cancelled during SSE streaming")
+            raise
+        except Exception as exc:
+            logger.error(f"Error during SSE chunk streaming: {exc}")
+            raise
         finally:
-            await upstream_resp.aclose()
-            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            # 1. Guarantee immediate socket close to prevent leaking upstream connections
+            try:
+                await upstream_resp.aclose()
+            except Exception as e:
+                logger.debug(f"Error closing upstream response: {e}")
 
-            if not usage_found or (prompt_tokens == 0 and completion_tokens == 0):
-                prompt_tokens = circuit_breaker.estimate_prompt_tokens(messages)
-                completion_tokens = max(1, completion_tokens)
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            prompt_tokens, completion_tokens = await accumulator.finish()
 
             cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
-            circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash)
+            circuit_breaker.record_success(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=cost_usd,
+                prompt_hash=prompt_hash,
+                session_id=session_id,
+            )
+
+            req_status = "cancelled" if is_cancelled else "success"
+            blocked_reason = "Client disconnected / stream cancelled" if is_cancelled else None
+
+            async def _finalize_record():
+                try:
+                    await _record_and_broadcast_request(
+                        db_path=db_path,
+                        model=model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cost_usd=cost_usd,
+                        latency_ms=latency_ms,
+                        prompt_hash=prompt_hash,
+                        status=req_status,
+                        blocked_reason=blocked_reason,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to log streaming request to DB: {e}")
 
             try:
-                await _record_and_broadcast_request(
-                    db_path=db_path,
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    cost_usd=cost_usd,
-                    latency_ms=latency_ms,
-                    prompt_hash=prompt_hash,
-                    status="success",
-                    blocked_reason=None,
-                )
-            except Exception as e:
-                logger.error(f"Failed to log streaming request to DB: {e}")
+                await asyncio.shield(_finalize_record())
+            except Exception:
+                pass
 
     return StreamingResponse(
         sse_generator(),

@@ -129,6 +129,8 @@ async def get_metrics(
                 COALESCE(SUM(CASE WHEN status = 'blocked_budget' THEN 1 ELSE 0 END), 0) AS blocked_budget_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_loop' THEN 1 ELSE 0 END), 0) AS blocked_loop_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_killswitch' THEN 1 ELSE 0 END), 0) AS blocked_killswitch_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_burn_rate' THEN 1 ELSE 0 END), 0) AS blocked_burn_rate_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_context_ballooning' THEN 1 ELSE 0 END), 0) AS blocked_context_ballooning_count,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN cost_usd ELSE 0.0 END), 0.0) AS total_spent,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN prompt_tokens ELSE 0 END), 0) AS total_prompt_tokens,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN completion_tokens ELSE 0 END), 0) AS total_completion_tokens,
@@ -378,3 +380,39 @@ async def clear_all_requests(db_path: Union[str, Path]) -> None:
     async with get_db(db_path) as db:
         await db.execute("DELETE FROM requests;")
         await db.commit()
+
+
+async def get_recent_spends(
+    db_path: Union[str, Path],
+    hours: float = 24.0,
+) -> List[Tuple[float, float]]:
+    """Retrieve recent successful spends (epoch_timestamp, cost_usd) within sliding hours window."""
+    cutoff = (
+        datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(hours=hours)
+    ).isoformat()
+    entries: List[Tuple[float, float]] = []
+    try:
+        async with get_readonly_db(db_path) as db:
+            query = """
+                SELECT timestamp, cost_usd
+                FROM requests
+                WHERE status = 'success' AND timestamp >= ? AND cost_usd > 0
+                ORDER BY timestamp ASC
+            """
+            async with db.execute(query, (cutoff,)) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    ts_str = row["timestamp"]
+                    cost = float(row["cost_usd"])
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=datetime.timezone.utc)
+                        entries.append((dt.timestamp(), cost))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return entries
+

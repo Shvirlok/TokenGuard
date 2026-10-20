@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     timeout: float = Field(default=60.0, description="Upstream HTTP timeout in seconds")
     profile: str = Field(default="careful", description="Active guard profile (careful, standard, passive)")
     passive: bool = Field(default=False, description="Passive observability mode")
+    max_burn_rate: Optional[str] = Field(default=None, description="Sliding window burn rate limit (e.g. $0.50/min, $2.00/5m)")
+    enable_context_ballooning: bool = Field(default=True, description="Enable runaway context ballooning guard")
 
     def model_post_init(self, __context) -> None:
         if self.max_repeats is not None:
@@ -53,6 +55,7 @@ class Settings(BaseSettings):
         if self.passive or self.profile == "passive":
             self.profile = "passive"
             self.loop_threshold = 0
+            self.enable_context_ballooning = False
 
 
 USER_CONFIG_DIR = Path.home() / ".tokenguard"

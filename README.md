@@ -22,11 +22,14 @@
 - [Screenshot Guide & Assets Checklist](#-screenshot-guide--assets-checklist)
 - [Core Features & Technical Deep Dive](#-core-features--technical-deep-dive)
   - [1. Infinite Loop Circuit Breaker](#1-infinite-loop-circuit-breaker)
-  - [2. Budget Limiter & Avoided Cost Ledger](#2-budget-limiter--avoided-cost-ledger)
-  - [3. Dynamic Real-Time Pricing Synchronizer](#3-dynamic-real-time-pricing-synchronizer)
-  - [4. Multi-Format Telemetry Exporter](#4-multi-format-telemetry-exporter)
-  - [5. Zero-Friction Python SDK](#5-zero-friction-python-sdk)
-  - [6. High-End Developer CLI & Web Dashboard](#6-high-end-developer-cli--web-dashboard)
+  - [2. Velocity & Burn-Rate Circuit Breaker](#2-velocity--burn-rate-circuit-breaker)
+  - [3. Context Ballooning Guard](#3-context-ballooning-guard)
+  - [4. True Zero-Latency Streaming (SSE Proxying)](#4-true-zero-latency-streaming-sse-proxying)
+  - [5. Budget Limiter & Avoided Cost Ledger](#5-budget-limiter--avoided-cost-ledger)
+  - [6. Dynamic Real-Time Pricing Synchronizer](#6-dynamic-real-time-pricing-synchronizer)
+  - [7. Multi-Format Telemetry Exporter](#7-multi-format-telemetry-exporter)
+  - [8. Zero-Friction Python SDK](#8-zero-friction-python-sdk)
+  - [9. High-End Developer CLI & Web Dashboard](#9-high-end-developer-cli--web-dashboard)
 - [Installation & Quickstart](#-installation--quickstart)
 - [Complete CLI Command Reference](#-complete-cli-command-reference)
   - [1. `tokenguard start`](#1-tokenguard-start)
@@ -248,27 +251,43 @@ All screenshots are stored in the [`assets/images/`](assets/images/) directory. 
 - **Sliding-window matching**: Compares the incoming prompt against the last $N$ requests inside a rolling time window (default: 60s).
 - **Non-poisoning architecture**: When an identical prompt is blocked with `429 Too Many Requests`, the rejection is **not** appended to the rolling window. As a result, when the agent fixes its state and sends a distinct prompt, it succeeds immediately.
 
-### 2. Budget limiter and avoided cost ledger
+### 2. Velocity & burn-rate circuit breaker
+- **Sliding window burn rate**: Beyond static prompt hashing, autonomous agents can burn budget across non-identical retry loops. TokenGuard tracks spending velocity with `--max-burn-rate` (e.g. `$0.50/min`, `$2.00/5m`, or `1.50/30s`).
+- **SQLite spend hydration**: Rehydrates previous 24 hours of expenditure on proxy boot to guarantee uninterrupted budget velocity enforcement across server restarts.
+- **Immediate hard cutoff**: Instantly trips before upstream execution with an HTTP 429 machine-readable payload showing current spend and breached threshold.
+
+### 3. Context ballooning guard
+- **Runaway context detection**: Autonomous agents trapped in retry loops monotonically expand their context as compiler errors and debug logs accumulate.
+- **Monotonic growth evaluation**: Tracks session sequence (`x-session-id`). If `prompt_tokens` increases by > 300% across 3 consecutive requests without an explicit task update or cache hit, it is blocked immediately as abnormal runaway context expansion.
+- **Bypass markers**: Automatically allows large context growth when accompanied by a task milestone (e.g. `x-task-status`, metadata commit status) or prompt caching hits (`x-cache-hit`).
+
+### 4. True zero-latency streaming (SSE proxying)
+- **Pass-through asynchronous streaming**: When `stream: true` is requested, chunks are yielded downstream immediately (< 5ms latency overhead) via `httpx.AsyncClient` and `fastapi.responses.StreamingResponse`. Never buffers responses in memory.
+- **Non-blocking background accounting (`StreamAccumulator`)**: Concurrently parses native provider usage frames (e.g. OpenAI `stream_options={"include_usage": true}` or Anthropic usage blocks) without introducing backpressure to the generator loop.
+- **Omitted usage fallback**: If upstream omits token usage, maintains a lightweight character accumulator to estimate tokens accurately.
+- **Robust connection lifecycle**: Gracefully handles client disconnects and `asyncio.CancelledError`, immediately closing upstream sockets to prevent socket leaks.
+
+### 5. Budget limiter and avoided cost ledger
 - **Dual sliding windows**: Monitors both sliding 1-hour and 24-hour spending totals against configurable caps (e.g. `--limit 5.0` for \$5/hr).
 - **Avoided cost calculation**: When a request is blocked, TokenGuard calculates how much money was saved based on the model's token rate, prompt size, and an estimated 500 completion tokens.
 - **Audio and desktop notifications**: Fires a non-blocking background notification (macOS AppleScript / Linux `notify-send`) and audible terminal bell when a runaway loop is intercepted.
 
-### 3. Dynamic real-time pricing synchronizer
+### 6. Dynamic real-time pricing synchronizer
 - **OpenRouter Live Registry**: Automatically fetches the latest pricing tables for over 400 models from `openrouter.ai/api/v1/models` without requiring an API key.
 - **Local TTL caching**: Saves cached rates to `~/.tokenguard/prices_cache.json` with a 24-hour TTL.
 - **Offline-first fallback**: If internet connectivity is down, it instantly falls back to the embedded [`tokenguard/prices.json`](tokenguard/prices.json) baseline.
 
-### 4. Multi-format telemetry exporter
+### 7. Multi-format telemetry exporter
 - **HAR 1.2 standard**: Exports valid HTTP Archive 1.2 files compatible with Chrome DevTools, Postman, and Charles Proxy, enriched with custom `_tokenCost`, `_promptTokens`, `_completionTokens`, and `_blockedReason` fields.
 - **JSONL and CSV**: Fast newline-delimited JSON and standard CSV streams for downstream data pipelines, Pandas, and SIEM logging.
 - **Non-blocking WAL queries**: Reads from SQLite with `PRAGMA query_only = ON;` and `PRAGMA synchronous = NORMAL;`, ensuring zero lock contention with active proxy writers.
 
-### 5. Zero-friction Python SDK
+### 8. Zero-friction Python SDK
 - **Function decorator (`@tokenguard.protect`)**: Protects synchronous or asynchronous functions with automatic proxy routing.
 - **Context manager (`with tokenguard.guard():`)**: Sets environment variables (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `DEEPSEEK_BASE_URL`, etc.) within the scope and safely restores them on exit or exceptions.
 - **Daemon auto-start**: Automatically starts the TokenGuard background daemon if it is not currently running.
 
-### 6. High-end developer CLI & web dashboard
+### 9. High-end developer CLI & web dashboard
 - **CLI TUI**: Built with Rich, featuring clean ASCII glyphs (`›`, `·`, `●`), zero-emoji clutter, and rock-solid column alignment that never wraps on 80-column terminals.
 - **Next.js web dashboard**: Dark-mode interface with live SSE updates, distribution charts, quickstart simulations, and interactive configuration controls.
 
@@ -343,6 +362,7 @@ tokenguard start [options]
 | `--port` | `int` | `8080` | Port for the proxy server and dashboard. |
 | `--limit` | `float` | `5.0` | Sliding hourly budget limit in USD. |
 | `--daily-limit` | `float` | `50.0` | Sliding daily budget limit in USD. |
+| `--max-burn-rate` | `str` | `None` | Maximum spending burn rate velocity limit (e.g. `$0.50/min`, `$2.00/5m`, `1.50/30s`). |
 | `--max-repeats` | `int` | `3` | Maximum identical consecutive requests before tripping (alias for `--loop-threshold`). |
 | `--loop-window` | `float` | `60.0` | Sliding time window in seconds for consecutive loop matching. |
 | `--profile` | `str` | `careful` | Preset profile: `careful` (\$5/hr, 2 loops), `standard` (\$15/hr, 4 loops), `passive`. |
@@ -350,8 +370,8 @@ tokenguard start [options]
 
 **Examples:**
 ```bash
-# Start in background with strict $2/hr limit and 2-loop cutoff
-tokenguard start -d --limit 2.0 --max-repeats 2
+# Start in background with strict $2/hr limit and $0.50/min burn rate velocity
+tokenguard start -d --limit 2.0 --max-burn-rate '$0.50/min'
 
 # Start in passive monitoring mode on custom port
 tokenguard start -d --port 9090 --passive
@@ -405,13 +425,15 @@ tokenguard run [options] -- <command> [args...]
 | :--- | :--- | :--- | :--- |
 | `--port` | `int` | `8080` | Proxy port to route traffic through. |
 | `--limit` | `float` | `5.0` | Hourly budget limit for this run. |
+| `--daily-limit` | `float` | `50.0` | Daily budget limit for this run. |
+| `--max-burn-rate` | `str` | `None` | Burn rate velocity limit for this run (e.g. `$0.50/min`). |
 | `--max-repeats` | `int` | `3` | Maximum loop repeats before blocking. |
 | `--passive` | Flag | `False` | Run in non-blocking observability mode. |
 
 **Examples:**
 ```bash
-# Protect a Python agent script
-tokenguard run -- python agent.py
+# Protect a Python agent script with burn rate and hourly limit
+tokenguard run --max-burn-rate '$0.50/min' --limit 5.0 -- python agent.py
 
 # Run an npm/Node.js autonomous agent
 tokenguard run -- npm start
@@ -620,6 +642,29 @@ TokenGuard exposes standard proxy routes alongside management and streaming endp
 | `POST` | `/api/config` | Dynamically update budget limits, loop threshold, and active profile. |
 | `POST` | `/api/simulate` | Trigger simulated loop or success events for onboarding validation. |
 | `POST` | `/api/clear-logs` | Wipe SQLite request logs and reset in-memory counters. |
+
+### Circuit breaker 429 error format
+
+When TokenGuard trips due to a burn-rate breach, context ballooning, budget limit, or prompt loop, it immediately cuts off upstream calls and returns an explicit, machine-readable HTTP 429 response:
+
+```json
+{
+  "error": {
+    "message": "TokenGuard Circuit Breaker Tripped: Burn rate exceeded ($0.58 in 42s). Hard limit: $0.50/min.",
+    "type": "tokenguard_budget_breach",
+    "code": "burn_rate_exceeded",
+    "current_spend": 0.58,
+    "budget_limit": 0.50
+  }
+}
+```
+
+*Common circuit breaker codes:*
+- `burn_rate_exceeded`: Sliding window spending velocity limit breached.
+- `context_ballooning_detected`: Prompt tokens expanded > 300% across 3 consecutive requests in session.
+- `budget_exceeded`: Sliding hourly or daily expenditure limit exceeded.
+- `loop_detected`: Identical prompt repeated consecutively.
+- `kill_switch_active`: Emergency kill switch active. |
 
 ---
 

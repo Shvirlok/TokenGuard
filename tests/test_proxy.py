@@ -1,6 +1,7 @@
 """Integration tests for TokenGuard FastAPI proxy, circuit breaker intercepts, and streaming."""
 
 import json
+import time
 import pytest
 import httpx
 from pathlib import Path
@@ -573,6 +574,197 @@ async def test_sse_stream_realtime_events(test_app):
             assert msg4["data"]["source"] == "cli"
     finally:
         proxy_module.broadcaster.unsubscribe(q)
+
+
+@pytest.mark.asyncio
+async def test_burn_rate_proxy_429_json_response(test_app):
+    """Verify that burn rate exceeded triggers HTTP 429 with explicit JSON schema."""
+    with TestClient(test_app) as client:
+        guard = proxy_module.get_guard()
+        guard.max_burn_rate = "$0.50/min"
+        guard.burn_rate_limit = 0.50
+        guard.burn_rate_window_seconds = 60.0
+        now = time.time()
+        # Seed spend exceeding $0.50 in the last minute
+        guard.burn_rate_records = [(now - 10, 0.35), (now - 5, 0.25)]
+
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Burn rate test prompt"}],
+        }
+
+        resp = client.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 429
+        data = resp.json()
+        assert "error" in data
+        err = data["error"]
+        assert err["type"] == "tokenguard_budget_breach"
+        assert err["code"] == "burn_rate_exceeded"
+        assert err["budget_limit"] == 0.50
+        assert err["current_spend"] >= 0.60
+        assert "Burn rate exceeded" in err["message"]
+        assert "Hard limit: $0.50/min" in err["message"]
+
+        # Verify DB logged the blocked burn rate request
+        reqs_resp = client.get("/api/requests?status=blocked")
+        assert reqs_resp.status_code == 200
+        records = reqs_resp.json()["requests"]
+        assert any(r["status"] == "blocked_burn_rate" for r in records)
+
+
+@pytest.mark.asyncio
+async def test_context_ballooning_proxy_429_json_response(test_app, monkeypatch):
+    """Verify that monotonic context expansion > 300% across 3 requests trips 429."""
+    with TestClient(test_app) as client:
+        guard = proxy_module.get_guard()
+        guard.enable_context_ballooning = True
+
+        async def mock_send(request, **kwargs):
+            req_body = json.loads(request.content)
+            req_msg = req_body["messages"][0]["content"]
+            tok_count = max(10, len(req_msg) // 4)
+            resp_payload = {
+                "id": "chatcmpl-cb",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Short reply"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": tok_count, "completion_tokens": 10, "total_tokens": tok_count + 10},
+            }
+            return httpx.Response(200, json=resp_payload)
+
+        monkeypatch.setattr(proxy_module.http_client, "send", mock_send)
+
+        headers = {"x-session-id": "agent-loop-sess"}
+
+        # Request 1: ~100 tokens
+        words_100 = "word " * 100
+        r1 = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": words_100}],
+        }, headers=headers)
+        assert r1.status_code == 200
+
+        # Request 2: ~250 tokens
+        words_250 = "word " * 250
+        r2 = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": words_250}],
+        }, headers=headers)
+        assert r2.status_code == 200
+
+        # Request 3: ~450 tokens (> 300% expansion from baseline)
+        words_450 = "word " * 450
+        r3 = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": words_450}],
+        }, headers=headers)
+        assert r3.status_code == 429
+        err = r3.json()["error"]
+        assert err["type"] == "tokenguard_budget_breach"
+        assert err["code"] == "context_ballooning_detected"
+        assert "Context ballooning detected" in err["message"]
+
+        # Request with task update status header should bypass
+        headers_with_task = {"x-session-id": "agent-loop-sess", "x-task-status": "refactored_subsystem"}
+        r_bypass = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": words_450}],
+        }, headers=headers_with_task)
+        assert r_bypass.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_zero_latency_streaming_omitted_usage(test_app, monkeypatch):
+    """Verify that when upstream omits usage, StreamAccumulator computes tokens and DB logs them."""
+    with TestClient(test_app) as client:
+        chunk1 = b'data: {"id":"chatcmpl-omitted","choices":[{"delta":{"content":"Zero "}}]}\n\n'
+        chunk2 = b'data: {"id":"chatcmpl-omitted","choices":[{"delta":{"content":"latency "}}]}\n\n'
+        chunk3 = b'data: {"id":"chatcmpl-omitted","choices":[{"delta":{"content":"streaming accumulator."}}]}\n\n'
+        chunk_done = b'data: [DONE]\n\n'
+
+        async def mock_aiter_bytes():
+            yield chunk1
+            yield chunk2
+            yield chunk3
+            yield chunk_done
+
+        class MockStreamResponse:
+            status_code = 200
+            headers = {"Content-Type": "text/event-stream"}
+            def aiter_bytes(self):
+                return mock_aiter_bytes()
+            async def aclose(self):
+                pass
+
+        async def mock_send(request, stream=False):
+            return MockStreamResponse()
+
+        monkeypatch.setattr(proxy_module.http_client, "send", mock_send)
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Stream without usage"}],
+            "stream": True,
+        }
+
+        resp = client.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 200
+        text = resp.text
+        assert "Zero " in text
+        assert "latency " in text
+        assert "streaming accumulator." in text
+        assert "[DONE]" in text
+
+        # Verify DB logged completion tokens > 0 (calculated from text chunks)
+        reqs_resp = client.get("/api/requests")
+        records = reqs_resp.json()["requests"]
+        assert len(records) >= 1
+        record = records[0]
+        assert record["status"] == "success"
+        assert record["completion_tokens"] > 0
+        assert record["cost_usd"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_streaming_client_disconnect_closes_upstream(test_app, monkeypatch):
+    """Verify that client disconnection / cancellation ensures upstream response is closed."""
+    import asyncio
+    closed_called = False
+
+    class MockStreamResponse:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+        async def aiter_bytes(self):
+            for i in range(10):
+                yield b'data: {"choices":[{"delta":{"content":"Chunk"}}}\n\n'
+                await asyncio.sleep(0.005)
+        async def aclose(self):
+            nonlocal closed_called
+            closed_called = True
+
+    async def mock_send(request, stream=False):
+        return MockStreamResponse()
+
+    with TestClient(test_app) as client:
+        monkeypatch.setattr(proxy_module.http_client, "send", mock_send)
+        try:
+            with client.stream("POST", "/v1/chat/completions", json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "Cancel test"}],
+                "stream": True,
+            }) as resp:
+                for line in resp.iter_lines():
+                    if line:
+                        break  # Disconnect after first chunk
+        except Exception:
+            pass
+
+    assert closed_called is True
+
 
 
 

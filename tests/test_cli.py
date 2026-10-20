@@ -489,5 +489,35 @@ def test_cli_passive_flag(monkeypatch):
     assert "--passive" in spawned_cmds[0]
 
 
+def test_cli_max_burn_rate_flag(monkeypatch):
+    """Verify that --max-burn-rate is parsed and passed to start_daemon."""
+    parser = create_parser()
+
+    # Test start with --max-burn-rate
+    args_start = parser.parse_args(["start", "--max-burn-rate", "$0.50/min"])
+    assert args_start.max_burn_rate == "$0.50/min"
+
+    # Test run with --max-burn-rate
+    args_run = parser.parse_args(["run", "--max-burn-rate", "$2.00/5m", "python", "script.py"])
+    assert args_run.max_burn_rate == "$2.00/5m"
+
+    spawned_cmds = []
+    def mock_popen(cmd, *args, **kwargs):
+        spawned_cmds.append(cmd)
+        proc = MagicMock()
+        proc.pid = 88888
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", mock_popen)
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    monkeypatch.setattr(cli_module, "wait_for_server", lambda h, p, timeout: True)
+
+    pid = start_daemon(port=8080, max_burn_rate="$0.50/min")
+    assert pid == 88888
+    assert "--max-burn-rate" in spawned_cmds[0]
+    assert "$0.50/min" in spawned_cmds[0]
+
+
+
 
 
