@@ -65,9 +65,7 @@ function playAlert() {
     osc.connect(gain).connect(ctx.destination)
     osc.start()
     osc.stop(ctx.currentTime + 0.3)
-  } catch {
-    // Audio unavailable (autoplay policy); alerts are optional.
-  }
+  } catch {}
 }
 
 export function TokenGuardProvider({ children }: { children: React.ReactNode }) {
@@ -91,8 +89,11 @@ export function TokenGuardProvider({ children }: { children: React.ReactNode }) 
     return null
   }, [mode, baseUrl])
 
-  const interval = polling ? 2000 : 0
-  const key = (name: string, ...extra: string[]) => (client ? ['tg', mode, baseUrl, name, ...extra] : null)
+  const interval = mode === 'demo' ? (polling ? 2000 : 0) : 0
+  const key = useCallback(
+    (name: string, ...extra: string[]) => (client ? ['tg', mode, baseUrl, name, ...extra] : null),
+    [client, mode, baseUrl],
+  )
 
   const { data: stats } = useSWR(key('stats'), () => client!.getStats(), { refreshInterval: interval })
   const { data: requests } = useSWR(key('requests', statusFilter), () => client!.getRequests(statusFilter), {
@@ -117,6 +118,125 @@ export function TokenGuardProvider({ children }: { children: React.ReactNode }) 
     }, 4000)
     return () => clearInterval(id)
   }, [mode, polling, refreshAll])
+
+  useEffect(() => {
+    if (mode !== 'live' || !baseUrl || !polling) return
+    if (typeof window === 'undefined' || !('EventSource' in window)) return
+
+    let es: EventSource | null = null
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let retryDelay = 1000
+
+    const connectSSE = () => {
+      try {
+        es = new EventSource(`${baseUrl}/api/events`)
+
+        es.onopen = () => {
+          retryDelay = 1000
+        }
+
+        es.addEventListener('stats', (e) => {
+          try {
+            const data = JSON.parse(e.data)
+            mutate(key('stats'), (prev: any) => ({ ...prev, ...data }), false)
+          } catch {}
+        })
+
+        es.addEventListener('request_logged', (e) => {
+          try {
+            const newReq: RequestRecord = JSON.parse(e.data)
+
+            const shouldInclude =
+              statusFilter === 'all' ||
+              (statusFilter === 'success' && newReq.status === 'success') ||
+              (statusFilter === 'blocked' && isBlocked(newReq.status))
+
+            if (shouldInclude) {
+              mutate(
+                key('requests', statusFilter),
+                (prev: RequestRecord[] = []) => [newReq, ...prev.filter((r) => r.id !== newReq.id)],
+                false,
+              )
+            }
+
+            if (statusFilter !== 'all') {
+              mutate(
+                key('requests', 'all'),
+                (prev: RequestRecord[] = []) => [newReq, ...prev.filter((r) => r.id !== newReq.id)],
+                false,
+              )
+            }
+
+            mutate(
+              key('stats'),
+              (prev: Stats | undefined) => {
+                if (!prev) return prev
+                const isSuccess = newReq.status === 'success'
+                const isBlockedReq = !isSuccess
+                const isLoop =
+                  newReq.status === 'blocked_loop' ||
+                  newReq.status === 'blocked_tool_loop' ||
+                  (newReq.blocked_reason?.toLowerCase().includes('loop') ?? false)
+                const isBudget = newReq.status === 'blocked_budget'
+
+                const avoidedTokens = isLoop ? Math.max((newReq.prompt_tokens || 110) * 3 + 1200, 1500) : 0
+                const avoidedCost = isLoop ? Math.max(avoidedTokens * 0.000005, 0.0075) : (isBudget ? 0.015 : 0)
+
+                return {
+                  ...prev,
+                  total_requests: prev.total_requests + 1,
+                  success_requests: isSuccess ? prev.success_requests + 1 : prev.success_requests,
+                  blocked_requests: isBlockedReq ? prev.blocked_requests + 1 : prev.blocked_requests,
+                  blocked_loop_count: isLoop ? (prev.blocked_loop_count || 0) + 1 : prev.blocked_loop_count,
+                  all_time_blocked_loops: isLoop ? (prev.all_time_blocked_loops || 0) + 1 : prev.all_time_blocked_loops,
+                  all_time_blocked_total: isBlockedReq ? (prev.all_time_blocked_total || 0) + 1 : prev.all_time_blocked_total,
+                  saved_cost_estimate: (prev.saved_cost_estimate || 0) + avoidedCost,
+                  total_spent: isSuccess ? prev.total_spent + (newReq.cost_usd || 0) : prev.total_spent,
+                  total_tokens: isSuccess ? prev.total_tokens + (newReq.total_tokens || 0) : prev.total_tokens,
+                }
+              },
+              false,
+            )
+
+            if (soundEnabled && isBlocked(newReq.status)) {
+              playAlert()
+            }
+          } catch {}
+        })
+
+        es.addEventListener('state_change', (e) => {
+          try {
+            const data = JSON.parse(e.data)
+            mutate(key('stats'), (prev: any) => ({ ...prev, ...data }), false)
+          } catch {}
+        })
+
+        es.addEventListener('logs_cleared', () => {
+          mutate(key('requests', statusFilter), [], false)
+          mutate(key('requests', 'all'), [], false)
+          refreshAll()
+        })
+
+        es.onerror = () => {
+          es?.close()
+          es = null
+          reconnectTimer = setTimeout(() => {
+            retryDelay = Math.min(retryDelay * 1.5, 10000)
+            connectSSE()
+          }, retryDelay)
+        }
+      } catch {
+        reconnectTimer = setTimeout(connectSSE, 3000)
+      }
+    }
+
+    connectSSE()
+
+    return () => {
+      es?.close()
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+    }
+  }, [mode, baseUrl, polling, statusFilter, soundEnabled, key, mutate, refreshAll])
 
   const lastSeenId = useRef<number | null>(null)
   useEffect(() => {
@@ -189,7 +309,12 @@ export function TokenGuardProvider({ children }: { children: React.ReactNode }) 
       if (!client) return
       const result = await run(`sim:${type}`, () => client.simulate(type))
       if (!result) return
-      if (result.simulation === 'loop') {
+      if (result.simulation === 'tool_loop') {
+        const toolName = result.tool_name || 'read_file'
+        toast.error('Tool Ping-Pong Intercepted', {
+          description: `[TOOL RETRY LOOP: HARD STOP] Intercepted repeated ${toolName} loop — circuit breaker tripped!`,
+        })
+      } else if (result.simulation === 'loop') {
         const blockedAt = result.results.find((r) => r.status !== 'allowed')
         if (blockedAt)
           toast.warning('Runaway loop intercepted', {

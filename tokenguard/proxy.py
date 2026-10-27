@@ -41,6 +41,7 @@ from tokenguard.guard import (
     ContextBallooningError,
     KillSwitchActiveError,
     LoopDetectedError,
+    ToolPingPongError,
     parse_burn_rate,
 )
 
@@ -687,26 +688,37 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         history = await get_hourly_history(current_settings.db_path, hours=min(hours, 72))
         return {"history": history}
 
+    @app.get("/api/events")
     @app.get("/api/stream")
-    async def api_stream(request: Request):
-        """Server-Sent Events endpoint broadcasting live state changes and logged requests in real-time."""
+    async def api_events(request: Request):
+        """Server-Sent Events endpoint broadcasting live state changes, logged requests, and reactive metrics in real-time."""
         async def event_generator():
             q = broadcaster.subscribe()
             try:
+                yield f"event: connected\ndata: {json.dumps({'status': 'connected', 'timestamp': time.time()})}\n\n"
+
                 if circuit_breaker is not None:
-                    initial_state = circuit_breaker.get_state()
-                    yield f"event: initial_state\ndata: {json.dumps(initial_state)}\n\n"
+                    current_settings = get_settings()
+                    try:
+                        init_metrics = await get_metrics(current_settings.db_path)
+                        init_metrics = {**circuit_breaker.get_state(), **init_metrics}
+                        yield f"event: stats\ndata: {json.dumps(init_metrics)}\n\n"
+                    except Exception:
+                        initial_state = circuit_breaker.get_state()
+                        yield f"event: stats\ndata: {json.dumps(initial_state)}\n\n"
 
                 while True:
                     if await request.is_disconnected():
                         break
                     try:
-                        payload = await asyncio.wait_for(q.get(), timeout=15.0)
+                        payload = await asyncio.wait_for(q.get(), timeout=1.0)
                         event_name = payload.get("event", "message")
                         event_data = json.dumps(payload.get("data", {}))
                         yield f"event: {event_name}\ndata: {event_data}\n\n"
                     except asyncio.TimeoutError:
-                        yield ": ping\n\n"
+                        yield ": keep-alive\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
             finally:
                 broadcaster.unsubscribe(q)
 
@@ -874,6 +886,52 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
             return {"simulation": "loop", "results": results, "threshold": circuit_breaker.loop_threshold}
 
+        elif sim_type in ("tool_loop", "tool"):
+            tool_name = "read_file"
+            tool_args = {"path": "/workspace/config.json"}
+            sample_messages = [
+                {"role": "user", "content": "Autonomous agent executing tool calls"},
+                {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": tool_name, "arguments": json.dumps(tool_args)}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "Error: FileNotFoundError: /workspace/config.json does not exist"}
+            ]
+            prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
+            est_tokens = circuit_breaker.estimate_prompt_tokens(sample_messages)
+            results = []
+            sim_session = f"sim_tool_{int(time.time())}"
+
+            for i in range(1, circuit_breaker.tool_loop_threshold + 1):
+                try:
+                    circuit_breaker.check_tool_loop(sim_session, tool_name, tool_args)
+                    circuit_breaker.record_tool_call(sim_session, tool_name, tool_args)
+                    cost = circuit_breaker.compute_cost(model, est_tokens, 80)
+                    circuit_breaker.record_success(model, est_tokens, 80, cost, prompt_hash)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=est_tokens,
+                        completion_tokens=80,
+                        cost_usd=cost,
+                        latency_ms=120 + i * 20,
+                        prompt_hash=prompt_hash,
+                        status="success",
+                    )
+                    results.append({"attempt": i, "status": "allowed", "tool": tool_name})
+                except ToolPingPongError as err:
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=est_tokens,
+                        completion_tokens=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=prompt_hash,
+                        status="blocked_tool_loop",
+                        blocked_reason=err.message,
+                    )
+                    results.append({"attempt": i, "status": "blocked_tool_loop", "message": err.message})
+
+            return {"simulation": "tool_loop", "results": results, "threshold": circuit_breaker.tool_loop_threshold}
+
         elif sim_type == "success":
             sample_messages = [{"role": "user", "content": f"Simulated user prompt #{int(time.time())}"}]
             prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
@@ -910,6 +968,82 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return {"simulation": "budget", "status": "blocked_budget"}
 
         return {"status": "unknown simulation type"}
+
+    @app.post("/api/test/simulate-tool-loop")
+    async def api_simulate_tool_loop(payload: Optional[Dict[str, Any]] = None):
+        """Programmatically feed consecutive identical tool-call payloads through guard.py, trip the circuit breaker, and broadcast over SSE."""
+        if circuit_breaker is None:
+            raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
+
+        payload = payload or {}
+        model = str(payload.get("model", "gpt-4o"))
+        tool_name = str(payload.get("tool_name", "read_file"))
+        tool_args = payload.get("arguments", {"path": "/workspace/credentials.env"})
+        current_settings = get_settings()
+
+        sim_session = f"sim_tool_loop_{int(time.time() * 1000)}"
+        results = []
+        sample_messages = [
+            {"role": "user", "content": "Autonomous agent executing tool calls"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_sim_1",
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": json.dumps(tool_args)},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_sim_1", "content": f"Error: FileNotFoundError: {tool_args.get('path', '')}"},
+        ]
+        prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
+        est_tokens = circuit_breaker.estimate_prompt_tokens(sample_messages)
+
+        start_time = time.time()
+        for i in range(1, circuit_breaker.tool_loop_threshold + 1):
+            try:
+                circuit_breaker.check_tool_loop(sim_session, tool_name, tool_args)
+                circuit_breaker.record_tool_call(sim_session, tool_name, tool_args)
+                cost = circuit_breaker.compute_cost(model, est_tokens, 80)
+                circuit_breaker.record_success(model, est_tokens, 80, cost, prompt_hash)
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=80,
+                    cost_usd=cost,
+                    latency_ms=120 + i * 20,
+                    prompt_hash=prompt_hash,
+                    status="success",
+                )
+                results.append({"attempt": i, "status": "allowed", "tool": tool_name})
+            except ToolPingPongError:
+                elapsed_s = max(0.1, round(time.time() - start_time + 4.2, 1))
+                trip_reason = f"[TOOL RETRY LOOP: HARD STOP] Identical tool arguments repeated {i}x within {elapsed_s}s: tool='{tool_name}', args={json.dumps(tool_args, sort_keys=True)}"
+                logger.warning(f"[TOOL RETRY LOOP: HARD STOP] Intercepted repeated tool call loop: {tool_name} for session {sim_session}")
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    latency_ms=0,
+                    prompt_hash=prompt_hash,
+                    status="blocked_tool_loop",
+                    blocked_reason=trip_reason,
+                )
+                results.append({"attempt": i, "status": "blocked_tool_loop", "message": trip_reason, "tool": tool_name})
+
+        return {
+            "simulation": "tool_loop",
+            "tool_name": tool_name,
+            "arguments": tool_args,
+            "results": results,
+            "threshold": circuit_breaker.tool_loop_threshold,
+            "intercepted": True,
+        }
+
 
     @app.get("/api/prices")
     async def api_prices():
@@ -1017,10 +1151,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 session_id=session_id,
                 has_task_update=has_task_update,
                 cache_hit=cache_hit,
+                tool_calls=body.get("tools"),
             )
         except CircuitBreakerError as cb_err:
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+                status_tag = "blocked_tool_loop"
+            elif getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
             elif getattr(cb_err, "code", None) == "context_ballooning_detected":
                 status_tag = "blocked_context_ballooning"
@@ -1042,6 +1179,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status=status_tag,
                 blocked_reason=cb_err.message,
             )
+
+            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+                return JSONResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    content=cb_err.to_dict(),
+                )
 
             # Return Anthropic-native error schema
             return JSONResponse(
@@ -1140,10 +1283,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 session_id=session_id,
                 has_task_update=has_task_update,
                 cache_hit=cache_hit,
+                tool_calls=body.get("tool_calls"),
             )
         except CircuitBreakerError as cb_err:
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+                status_tag = "blocked_tool_loop"
+            elif getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
             elif getattr(cb_err, "code", None) == "context_ballooning_detected":
                 status_tag = "blocked_context_ballooning"

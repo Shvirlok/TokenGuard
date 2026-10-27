@@ -42,7 +42,13 @@ export function createLiveClient(base: string): TokenGuardClient {
     updateConfig: async (update) => {
       await call('/api/config', { ...update, source: 'web' })
     },
-    simulate: (type) => call('/api/simulate', { type }),
+    simulate: (type) =>
+      type === 'tool_loop'
+        ? call('/api/test/simulate-tool-loop', {
+            tool_name: 'read_file',
+            arguments: { path: '/workspace/credentials.env' },
+          })
+        : call('/api/simulate', { type }),
     clearLogs: async () => {
       await call('/api/clear-logs', { source: 'web' })
     },

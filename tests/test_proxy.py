@@ -766,6 +766,80 @@ async def test_streaming_client_disconnect_closes_upstream(test_app, monkeypatch
     assert closed_called is True
 
 
+def test_tool_ping_pong_proxy_intercept(test_app):
+    """Verify that repeated tool call loops trip the circuit breaker and return 429 with TOOL_PING_PONG_LOOP."""
+    with TestClient(test_app) as client:
+        guard = proxy_module.get_guard()
+        guard.reset()
+        guard.tool_loop_threshold = 3
+
+        headers = {"x-session-id": "test-tool-loop-session"}
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Execute tool"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "config.json"}'}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "Error: FileNotFoundError: config.json"},
+                {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "config.json"}'}}]},
+                {"role": "tool", "tool_call_id": "c2", "content": "Error: FileNotFoundError: config.json"},
+                {"role": "assistant", "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "config.json"}'}}]},
+            ],
+        }
+
+        resp = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert resp.status_code == 429
+        data = resp.json()
+        assert "error" in data
+        assert data["error"]["type"] == "circuit_breaker"
+        assert data["error"]["code"] == "TOOL_PING_PONG_LOOP"
+        assert "TokenGuard intercepted repeated tool call loop: read_file" in data["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_api_events_sse_endpoint(test_app):
+    """Verify that GET /api/events establishes SSE text/event-stream StreamingResponse."""
+    from starlette.requests import Request
+    scope = {"type": "http", "method": "GET", "path": "/api/events", "headers": []}
+    req = Request(scope)
+    endpoint = None
+    for route in test_app.routes:
+        if getattr(route, "path", None) == "/api/events":
+            endpoint = route.endpoint
+            break
+    assert endpoint is not None
+    resp = await endpoint(req)
+    assert resp.media_type == "text/event-stream"
+    assert resp.headers["cache-control"] == "no-cache"
+    assert resp.headers["connection"] == "keep-alive"
+
+
+
+def test_simulate_tool_loop_endpoint(test_app):
+    """Verify that POST /api/test/simulate-tool-loop trips circuit breaker and returns intercepted result."""
+    with TestClient(test_app) as client:
+        resp = client.post("/api/test/simulate-tool-loop", json={
+            "tool_name": "read_file",
+            "arguments": {"path": "/workspace/credentials.env"}
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["simulation"] == "tool_loop"
+        assert data["tool_name"] == "read_file"
+        assert data["intercepted"] is True
+        assert len(data["results"]) == 3
+        assert data["results"][-1]["status"] == "blocked_tool_loop"
+        assert "[TOOL RETRY LOOP: HARD STOP]" in data["results"][-1]["message"]
+
+        reqs = client.get("/api/requests").json()["requests"]
+        tool_loop_reqs = [r for r in reqs if r["status"] == "blocked_tool_loop"]
+        assert len(tool_loop_reqs) >= 1
+        assert "[TOOL RETRY LOOP: HARD STOP]" in tool_loop_reqs[0]["blocked_reason"]
+
+
+
+
+
+
 
 
 

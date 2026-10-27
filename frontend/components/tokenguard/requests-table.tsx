@@ -29,9 +29,7 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
       aria-label="Traffic Stream Logs"
       className="flex h-full min-h-0 flex-col rounded border border-[#27272a] bg-[#101012] font-mono"
     >
-      {/* Stream Header & Controls */}
       <div className="flex shrink-0 items-center justify-between border-b border-[#27272a] px-3 py-2 text-xs">
-        {/* Left: Stream Title + Live indicator + Trigger Test Loop button */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-zinc-200">
             <span
@@ -45,22 +43,19 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
 
           <div className="h-3 w-px bg-[#27272a]" />
 
-          {/* Trigger Test Loop Button */}
           <button
             type="button"
-            onClick={() => simulate('loop')}
-            disabled={pending === 'sim:loop'}
-            title="Simulate identical prompt calls to trigger the loop breaker"
+            onClick={() => simulate('tool_loop')}
+            disabled={pending === 'sim:tool_loop' || pending === 'sim:loop'}
+            title="Simulate repeated tool-call loop to trigger the circuit breaker"
             className="inline-flex h-6 items-center gap-1.5 rounded border border-[#3f3f46] bg-[#18181b] px-2 text-[10px] font-semibold tracking-wider uppercase text-zinc-200 transition-colors hover:border-amber-700 hover:bg-amber-950/30 hover:text-amber-400 disabled:opacity-50 cursor-pointer"
           >
             <Zap className="size-2.5 text-amber-400" />
-            <span>{pending === 'sim:loop' ? 'RUNNING…' : 'TRIGGER TEST LOOP'}</span>
+            <span>{pending === 'sim:tool_loop' || pending === 'sim:loop' ? 'RUNNING…' : '+ TRIGGER TEST LOOP'}</span>
           </button>
         </div>
 
-        {/* Right: Search, Filter, Play/Pause, Clear */}
         <div className="flex items-center gap-2">
-          {/* Search box */}
           <div className="relative">
             <Search className="pointer-events-none absolute top-1/2 left-2 size-3 -translate-y-1/2 text-zinc-500" />
             <input
@@ -72,7 +67,6 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
             />
           </div>
 
-          {/* Status Filter */}
           <div className="flex rounded border border-[#27272a] bg-[#09090b] p-0.5 text-[10px]">
             {(['all', 'success', 'blocked'] as StatusFilter[]).map((f) => (
               <button
@@ -91,7 +85,6 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
             ))}
           </div>
 
-          {/* Polling Toggle */}
           <button
             type="button"
             onClick={() => setPolling(!polling)}
@@ -106,7 +99,6 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
             {polling ? <Pause className="size-2.5" /> : <Play className="size-2.5" />}
           </button>
 
-          {/* Clear Logs */}
           {onClearLogs && (
             <button
               type="button"
@@ -120,7 +112,6 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
         </div>
       </div>
 
-      {/* Table Container - Scrollable internal body */}
       <div className="flex-1 min-h-0 overflow-y-auto">
         <table className="w-full text-left text-[11px] border-collapse">
           <thead className="sticky top-0 z-10 border-b border-[#27272a] bg-[#141416] text-[10px] uppercase text-zinc-500 tracking-wider">
@@ -142,7 +133,13 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
             )}
 
             {rows.map((r) => {
-              const isLoopBlocked = r.status === 'blocked_loop' || (r.blocked_reason?.toLowerCase().includes('loop') ?? false)
+              const isToolLoopBlocked =
+                r.status === 'blocked_tool_loop' ||
+                (Boolean(r.blocked_reason?.toLowerCase().includes('tool')) &&
+                  Boolean(r.blocked_reason?.toLowerCase().includes('loop')))
+              const isLoopBlocked =
+                r.status === 'blocked_loop' ||
+                (!isToolLoopBlocked && Boolean(r.blocked_reason?.toLowerCase().includes('loop')))
               const isBudgetBlocked = r.status === 'blocked_budget'
               const isKilled = r.status === 'blocked_killswitch'
               const isSuccess = r.status === 'success'
@@ -153,15 +150,13 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
                   onClick={() => onInspect(r)}
                   className={cn(
                     'group cursor-pointer transition-colors hover:bg-[#18181b]/80 select-none',
-                    isLoopBlocked && 'bg-rose-950/20 hover:bg-rose-950/30'
+                    (isToolLoopBlocked || isLoopBlocked) && 'bg-rose-950/20 hover:bg-rose-950/30'
                   )}
                 >
-                  {/* Timestamp */}
                   <td className="py-1.5 pl-3 pr-2 text-zinc-500 whitespace-nowrap">
                     {formatTime(r.timestamp)}
                   </td>
 
-                  {/* Endpoint */}
                   <td className="py-1.5 px-2 font-mono text-zinc-300">
                     <div className="flex items-center gap-1.5">
                       <span className="text-zinc-300 font-medium">/v1/chat/completions</span>
@@ -169,9 +164,13 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
                     </div>
                   </td>
 
-                  {/* Status & Highlighted Circuit Breaker line */}
                   <td className="py-1.5 px-2 whitespace-nowrap">
-                    {isLoopBlocked ? (
+                    {isToolLoopBlocked ? (
+                      <span className="inline-flex items-center gap-1.5 rounded border border-rose-500/80 bg-rose-950/60 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-rose-300">
+                        <span className="size-1.5 rounded-full bg-rose-500 animate-pulse" />
+                        [TOOL RETRY LOOP: HARD STOP]
+                      </span>
+                    ) : isLoopBlocked ? (
                       <span className="inline-flex items-center gap-1.5 rounded border border-rose-500/80 bg-rose-950/60 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-rose-300">
                         <span className="size-1.5 rounded-full bg-rose-500 animate-pulse" />
                         [CIRCUIT BREAKER: HARD STOP]
@@ -194,12 +193,10 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
                     )}
                   </td>
 
-                  {/* Tokens */}
                   <td className="py-1.5 px-2 text-right text-zinc-300 whitespace-nowrap">
                     {r.total_tokens ? `${formatNumber(r.total_tokens)} tok` : '—'}
                   </td>
 
-                  {/* Latency */}
                   <td className="py-1.5 pr-3 pl-2 text-right text-zinc-500 whitespace-nowrap">
                     {r.latency_ms ? `${Math.round(r.latency_ms)}ms` : '—'}
                   </td>
@@ -210,7 +207,6 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
         </table>
       </div>
 
-      {/* Compact footer status for table */}
       <div className="flex shrink-0 items-center justify-between border-t border-[#27272a] px-3 py-1 text-[10px] text-zinc-500">
         <span>
           Showing {rows.length} of {requests?.length ?? 0} events
@@ -220,3 +216,4 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
     </section>
   )
 }
+

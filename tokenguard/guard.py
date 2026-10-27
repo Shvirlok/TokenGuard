@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import difflib
 import hashlib
 import json
 import logging
@@ -83,7 +84,6 @@ def send_block_notification(
     """
     def _notify() -> None:
         try:
-            # 1. Audible terminal bell (if sound enabled)
             if sound:
                 try:
                     sys.stderr.write("\a")
@@ -93,7 +93,6 @@ def send_block_notification(
 
             system = platform.system().lower()
             if system == "darwin":
-                # macOS AppleScript notification
                 safe_title = title.replace('"', '\\"')
                 safe_msg = message.replace('"', '\\"')
                 script = f'display notification "{safe_msg}" with title "{safe_title}" sound name "Ping"'
@@ -104,7 +103,6 @@ def send_block_notification(
                     check=False,
                 )
             elif system == "linux":
-                # Linux notify-send
                 if shutil.which("notify-send"):
                     subprocess.run(
                         ["notify-send", "-u", "critical", "-a", "TokenGuard", title, message],
@@ -113,7 +111,6 @@ def send_block_notification(
                         check=False,
                     )
         except Exception:
-            # Fail silently and gracefully without disrupting proxy operation
             pass
 
     try:
@@ -220,6 +217,130 @@ class LoopDetectedError(CircuitBreakerError):
         super().__init__(message=message, error_type="loop_detected", status_code=429)
 
 
+class ToolPingPongError(CircuitBreakerError):
+    """Tripped when an autonomous agent gets stuck in a repetitive tool-call loop."""
+
+    def __init__(
+        self,
+        tool_name: str,
+        message: Optional[str] = None,
+        repeats: int = 3,
+        repeat_count: Optional[int] = None,
+        tool_args: Optional[str] = None,
+        elapsed_seconds: Optional[float] = None,
+    ):
+        msg = message or f"TokenGuard intercepted repeated tool call loop: {tool_name}"
+        final_repeats = repeat_count if repeat_count is not None else repeats
+        super().__init__(
+            message=msg,
+            error_type="circuit_breaker",
+            status_code=429,
+            code="TOOL_PING_PONG_LOOP",
+            tool_name=tool_name,
+            repeats=final_repeats,
+        )
+        self.tool_name = tool_name
+        self.repeats = final_repeats
+        self.repeat_count = final_repeats
+        self.tool_args = tool_args
+        self.elapsed_seconds = elapsed_seconds
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error": {
+                "type": "circuit_breaker",
+                "code": "TOOL_PING_PONG_LOOP",
+                "message": self.message,
+                "tool_name": self.tool_name,
+                "repeats": self.repeats,
+            }
+        }
+
+
+def normalize_tool_arguments(args: Any) -> Tuple[str, Any]:
+    """Normalize tool arguments into stable canonical JSON string and parsed object.
+
+    Strips whitespace, sorts keys recursively, and formats without extra spacing.
+    """
+    if isinstance(args, str):
+        s = args.strip()
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                clean_dict = {k: (v.strip() if isinstance(v, str) else v) for k, v in parsed.items()}
+                return json.dumps(clean_dict, sort_keys=True, separators=(",", ":")), clean_dict
+            return json.dumps(parsed, sort_keys=True, separators=(",", ":")), parsed
+        except Exception:
+            return s, s
+    elif isinstance(args, dict):
+        clean_dict = {k: (v.strip() if isinstance(v, str) else v) for k, v in args.items()}
+        return json.dumps(clean_dict, sort_keys=True, separators=(",", ":")), clean_dict
+    elif isinstance(args, (list, tuple)):
+        return json.dumps(list(args), sort_keys=True, separators=(",", ":")), args
+    else:
+        s = str(args).strip()
+        return s, s
+
+
+def compute_argument_similarity(args_str1: str, args_str2: str) -> float:
+    """Compute normalized argument overlap between 0.0 and 1.0 using standard library difflib."""
+    if args_str1 == args_str2:
+        return 1.0
+    if not args_str1 or not args_str2:
+        return 0.0
+    return difflib.SequenceMatcher(None, args_str1, args_str2).ratio()
+
+
+def extract_tool_calls(payload_or_messages: Any) -> List[Tuple[str, str, Any]]:
+    """Extract tool calls from request payload or messages list.
+
+    Returns a list of (tool_name, normalized_args_string, raw_args).
+    """
+    results: List[Tuple[str, str, Any]] = []
+
+    def _add(name: Any, args: Any):
+        if name and isinstance(name, str) and name.strip():
+            norm_str, raw_obj = normalize_tool_arguments(args)
+            results.append((name.strip(), norm_str, raw_obj))
+
+    def _process_item(item: Any):
+        if not isinstance(item, dict):
+            return
+
+        tool_calls = item.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    fn = tc.get("function")
+                    if isinstance(fn, dict):
+                        _add(fn.get("name"), fn.get("arguments", {}))
+                    else:
+                        _add(tc.get("name"), tc.get("arguments") or tc.get("input", {}))
+
+        fn_call = item.get("function_call")
+        if isinstance(fn_call, dict):
+            _add(fn_call.get("name"), fn_call.get("arguments", {}))
+
+        content = item.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    _add(block.get("name"), block.get("input", {}))
+
+    if isinstance(payload_or_messages, list):
+        for msg in payload_or_messages:
+            _process_item(msg)
+    elif isinstance(payload_or_messages, dict):
+        messages = payload_or_messages.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                _process_item(msg)
+        else:
+            _process_item(payload_or_messages)
+
+    return results
+
+
 class KillSwitchActiveError(CircuitBreakerError):
     def __init__(self, message: str = "TokenGuard: kill switch active"):
         super().__init__(message=message, error_type="kill_switch_active", status_code=429)
@@ -248,16 +369,13 @@ def lookup_model_pricing(
 
     model_clean = model.strip().lower()
 
-    # Exact match
     if model_clean in table:
         return table[model_clean]
 
-    # Prefix matching (e.g. gpt-4o-2024-08-06 -> gpt-4o, deepseek-chat-v3 -> deepseek-chat)
     for key, rates in table.items():
         if key != "default" and model_clean.startswith(key):
             return rates
 
-    # Strip optional provider prefix like "deepseek/deepseek-chat" or "openai/gpt-4o"
     short_name = model_clean.split("/")[-1]
     if short_name in table:
         return table[short_name]
@@ -296,6 +414,7 @@ class CircuitBreaker:
         hourly_limit: float = 5.0,
         daily_limit: float = 50.0,
         loop_threshold: int = 3,
+        tool_loop_threshold: int = 3,
         loop_window_size: int = 20,
         loop_window_seconds: float = 60.0,
         prices_path: Optional[Path] = None,
@@ -308,6 +427,7 @@ class CircuitBreaker:
         self.hourly_limit = hourly_limit
         self.daily_limit = daily_limit
         self.loop_threshold = loop_threshold
+        self.tool_loop_threshold = tool_loop_threshold
         self.loop_window_size = loop_window_size
         self.loop_window_seconds = loop_window_seconds
         self.kill_switch_active = kill_switch
@@ -324,18 +444,14 @@ class CircuitBreaker:
             if parsed:
                 self.burn_rate_limit, self.burn_rate_window_seconds = parsed
 
-        # Rolling window of recent spends: deque of (epoch_timestamp, cost_usd)
         self._spend_records: Deque[Tuple[float, float]] = collections.deque()
-
-        # Bounded in-memory sliding window for prompt hashes: deque of (epoch_timestamp, hash_str)
         self.recent_hashes: Deque[Tuple[float, str]] = collections.deque(maxlen=loop_window_size)
-
-        # In-memory session tracking for context ballooning guard: session_id -> deque of request records
         self._session_history: Dict[str, Deque[Dict[str, Any]]] = collections.defaultdict(
             lambda: collections.deque(maxlen=20)
         )
-
-        # In-memory pricing table
+        self._tool_history: Dict[str, Deque[Tuple[float, str, str]]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=20)
+        )
         self.prices: Dict[str, Dict[str, float]] = self._load_prices()
 
     @property
@@ -502,6 +618,82 @@ class CircuitBreaker:
         tail = [h for _, h in list(self.recent_hashes)[-needed_prior:]]
         return all(h == incoming_hash for h in tail)
 
+    def check_tool_loop(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: Any,
+    ) -> None:
+        """Check if an incoming tool invocation repeats >= tool_loop_threshold consecutive times with >= 90% overlap."""
+        if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
+            return
+
+        canonical_args, _ = normalize_tool_arguments(arguments)
+        history = self._tool_history[session_id]
+
+        needed = self.tool_loop_threshold - 1
+        if len(history) >= needed:
+            tail = list(history)[-needed:]
+            same_tool = all(t_name == tool_name for _, t_name, _ in tail)
+            if same_tool:
+                similar_args = all(
+                    compute_argument_similarity(t_args, canonical_args) >= 0.90
+                    for _, _, t_args in tail
+                )
+                if similar_args:
+                    now = time.time()
+                    earliest_ts = tail[0][0]
+                    elapsed = max(0.1, round(now - earliest_ts, 1))
+                    msg = f"TokenGuard intercepted repeated tool call loop: {tool_name}"
+                    if self.enable_notifications:
+                        send_block_notification(
+                            title="TokenGuard Tool Loop Alert",
+                            message=f"[TOOL RETRY LOOP: HARD STOP] Tool '{tool_name}' repeated {self.tool_loop_threshold}x within {elapsed}s",
+                        )
+                    raise ToolPingPongError(
+                        tool_name=tool_name,
+                        message=msg,
+                        repeats=self.tool_loop_threshold,
+                        tool_args=canonical_args,
+                        elapsed_seconds=elapsed,
+                    )
+
+    def record_tool_call(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: Any,
+    ) -> None:
+        """Record an executed tool invocation into the session's rolling window."""
+        canonical_args, _ = normalize_tool_arguments(arguments)
+        self._tool_history[session_id].append((time.time(), tool_name, canonical_args))
+
+    def check_message_tool_loop(self, messages: Any) -> None:
+        """Check if the messages history itself contains repeated consecutive tool calls."""
+        if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
+            return
+
+        extracted = extract_tool_calls(messages)
+        if len(extracted) < self.tool_loop_threshold:
+            return
+
+        tail = extracted[-self.tool_loop_threshold:]
+        first_tool_name = tail[0][0]
+        if all(name == first_tool_name for name, _, _ in tail):
+            last_args = tail[-1][1]
+            if all(compute_argument_similarity(args_str, last_args) >= 0.90 for _, args_str, _ in tail[:-1]):
+                msg = f"TokenGuard intercepted repeated tool call loop: {first_tool_name}"
+                if self.enable_notifications:
+                    send_block_notification(
+                        title="TokenGuard Tool Loop Alert",
+                        message=msg,
+                    )
+                raise ToolPingPongError(
+                    tool_name=first_tool_name,
+                    message=msg,
+                    repeat_count=self.tool_loop_threshold,
+                )
+
     def check_context_ballooning(
         self,
         session_id: str,
@@ -530,7 +722,6 @@ class CircuitBreaker:
         r1 = history[-2]
         r2 = history[-1]
 
-        # If any prior request in window had a task update or cache hit, do not trip
         if r1.get("has_task_update") or r1.get("cache_hit") or r2.get("has_task_update") or r2.get("cache_hit"):
             return
 
@@ -538,11 +729,8 @@ class CircuitBreaker:
         tokens_2 = r2.get("prompt_tokens", 0)
         tokens_3 = incoming_tokens
 
-        # Check monotonic context growth across 3 consecutive requests
-        # and minimum token baseline (>= 50 tokens) to prevent false positives on tiny prompts
         if tokens_1 >= 50 and tokens_3 > tokens_2 and tokens_2 > tokens_1:
             growth_ratio = (tokens_3 - tokens_1) / float(tokens_1)
-            # Expands by > 300%
             if growth_ratio > 3.0:
                 growth_pct = int(growth_ratio * 100)
                 msg = (
@@ -588,12 +776,14 @@ class CircuitBreaker:
         has_task_update: bool = False,
         cache_hit: bool = False,
         incoming_tokens: Optional[int] = None,
+        tool_calls: Optional[List[Any]] = None,
     ) -> str:
         """Run pre-flight checks against circuit breaker guards.
 
         Raises:
             KillSwitchActiveError: If manual kill switch is enabled.
             LoopDetectedError: If the same prompt hash repeated >= threshold times consecutively.
+            ToolPingPongError: If repeated tool calls detected.
             ContextBallooningError: If prompt tokens expand > 300% across 3 consecutive requests.
             BurnRateExceededError: If sliding window burn rate limit is exceeded.
             BudgetExceededError: If sliding hourly or daily budget limit is exceeded.
@@ -604,30 +794,32 @@ class CircuitBreaker:
         prompt_hash = self.compute_prompt_hash(messages)
         sess = session_id or "default"
 
-        # 1. Kill Switch Check
         if self.kill_switch_active:
             raise KillSwitchActiveError()
 
-        # Passive mode bypasses loop & budget cutoffs for pure telemetry
         if self.active_profile == "passive":
             self.record_request_hash(prompt_hash)
             return prompt_hash
 
-        # 2. Infinite Loop Detection Check
         if self.check_loop(prompt_hash):
             if self.enable_notifications:
                 send_block_notification(
                     title="TokenGuard Alert",
                     message=f"Infinite loop detected & blocked for model '{model}' ({self.loop_threshold} identical consecutive requests)",
                 )
-            # Rejection must NOT poison the history window
             raise LoopDetectedError(
                 f"TokenGuard: infinite agent loop detected ({self.loop_threshold} identical consecutive requests)"
             )
 
+        self.check_message_tool_loop(messages)
+        extracted_tools = extract_tool_calls(tool_calls or messages)
+        if extracted_tools:
+            latest_tool_name, _, raw_args = extracted_tools[-1]
+            self.check_tool_loop(sess, latest_tool_name, raw_args)
+            self.record_tool_call(sess, latest_tool_name, raw_args)
+
         est_tokens = incoming_tokens if incoming_tokens is not None else self.estimate_prompt_tokens(messages)
 
-        # 3. Context Ballooning Guard Check
         self.check_context_ballooning(
             session_id=sess,
             incoming_tokens=est_tokens,
@@ -635,7 +827,6 @@ class CircuitBreaker:
             cache_hit=cache_hit,
         )
 
-        # 4. Burn-Rate Engine Check
         if self.burn_rate_limit is not None and self.burn_rate_window_seconds is not None and self.burn_rate_limit > 0:
             window_spend, elapsed_s = self.get_burn_rate_spend(self.burn_rate_window_seconds)
             estimated_cost = self.estimate_cost(model, messages)
@@ -656,22 +847,18 @@ class CircuitBreaker:
                     budget_limit=round(self.burn_rate_limit, 2),
                 )
 
-        # 5. Budget Guard Check
         if self.hourly_limit > 0:
             current_hourly_spend = self.get_hourly_spend()
             estimated_cost = self.estimate_cost(model, messages)
             if (current_hourly_spend + estimated_cost) > self.hourly_limit:
-                # Rejection must NOT poison the history window
                 raise BudgetExceededError("TokenGuard: budget limit exceeded")
 
         if self.daily_limit > 0:
             current_daily_spend = self.get_daily_spend()
             estimated_cost = self.estimate_cost(model, messages)
             if (current_daily_spend + estimated_cost) > self.daily_limit:
-                # Rejection must NOT poison the history window
                 raise BudgetExceededError("TokenGuard: daily budget limit exceeded")
 
-        # Request passed all pre-flight checks: append to recent_hashes and session sequence
         self.record_request_hash(prompt_hash)
         self._session_history[sess].append({
             "prompt_tokens": est_tokens,
@@ -709,10 +896,11 @@ class CircuitBreaker:
         self.recent_hashes.clear()
 
     def reset(self) -> None:
-        """Reset all in-memory rolling state (hash history, spend records, session tracking, kill switch)."""
+        """Reset all in-memory rolling state (hash history, spend records, session tracking, tool tracking, kill switch)."""
         self.recent_hashes.clear()
         self._spend_records.clear()
         self._session_history.clear()
+        self._tool_history.clear()
         self.kill_switch_active = False
 
     def toggle_kill_switch(self, active: Optional[bool] = None) -> bool:
@@ -728,6 +916,7 @@ class CircuitBreaker:
         hourly_limit: Optional[float] = None,
         daily_limit: Optional[float] = None,
         loop_threshold: Optional[int] = None,
+        tool_loop_threshold: Optional[int] = None,
         profile: Optional[str] = None,
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: Optional[bool] = None,
@@ -739,6 +928,8 @@ class CircuitBreaker:
             self.daily_limit = float(daily_limit)
         if loop_threshold is not None and loop_threshold >= 0:
             self.loop_threshold = int(loop_threshold)
+        if tool_loop_threshold is not None and tool_loop_threshold >= 0:
+            self.tool_loop_threshold = int(tool_loop_threshold)
         if profile:
             self.active_profile = str(profile).lower()
         if max_burn_rate is not None:
@@ -784,6 +975,7 @@ class CircuitBreaker:
                 (hourly_spend / self.hourly_limit * 100.0) if self.hourly_limit > 0 else 0.0, 2
             ),
             "loop_threshold": self.loop_threshold,
+            "tool_loop_threshold": self.tool_loop_threshold,
             "loop_window_size": self.loop_window_size,
             "recent_hashes_count": len(self.recent_hashes),
         }

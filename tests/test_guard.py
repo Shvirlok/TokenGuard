@@ -371,5 +371,82 @@ def test_context_ballooning_bypass_with_task_or_cache():
     guard.check_request(msg3, "gpt-4o", session_id="different-session", incoming_tokens=500)
 
 
+def test_tool_ping_pong_loop_detection():
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-session-1"
+
+    guard.check_tool_loop(session, "read_file", {"path": "/var/log/app.log"})
+    guard.record_tool_call(session, "read_file", {"path": "/var/log/app.log"})
+
+    guard.check_tool_loop(session, "read_file", {"path": "/var/log/app.log"})
+    guard.record_tool_call(session, "read_file", {"path": "/var/log/app.log"})
+
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, "read_file", {"path": "/var/log/app.log"})
+
+    err = exc_info.value
+    assert err.code == "TOOL_PING_PONG_LOOP"
+    assert err.error_type == "circuit_breaker"
+    assert err.to_dict() == {
+        "error": {
+            "type": "circuit_breaker",
+            "code": "TOOL_PING_PONG_LOOP",
+            "message": "TokenGuard intercepted repeated tool call loop: read_file",
+            "tool_name": "read_file",
+            "repeats": 3,
+        }
+    }
+
+
+def test_tool_ping_pong_fuzzy_similarity_detection():
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-session-fuzzy"
+
+    guard.check_tool_loop(session, "bash", {"command": "curl http://127.0.0.1/health", "timeout": 10})
+    guard.record_tool_call(session, "bash", {"command": "curl http://127.0.0.1/health", "timeout": 10})
+
+    guard.check_tool_loop(session, "bash", {"command": "curl http://127.0.0.1/health ", "timeout": 10})
+    guard.record_tool_call(session, "bash", {"command": "curl http://127.0.0.1/health ", "timeout": 10})
+
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, "bash", {"command": "curl http://127.0.0.1/health", "timeout": 10})
+
+    assert exc_info.value.code == "TOOL_PING_PONG_LOOP"
+
+
+def test_tool_ping_pong_progression_allowed():
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-session-progress"
+
+    guard.check_tool_loop(session, "read_file", {"path": "module_a.py"})
+    guard.record_tool_call(session, "read_file", {"path": "module_a.py"})
+
+    guard.check_tool_loop(session, "read_file", {"path": "completely_different_component_b.py"})
+    guard.record_tool_call(session, "read_file", {"path": "completely_different_component_b.py"})
+
+    guard.check_tool_loop(session, "read_file", {"path": "third_unrelated_service_c.py"})
+    guard.record_tool_call(session, "read_file", {"path": "third_unrelated_service_c.py"})
+
+
+def test_tool_ping_pong_in_messages_history():
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+
+    messages = [
+        {"role": "user", "content": "Fix bug in app"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "bug.py"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "FileNotFoundError"},
+        {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "bug.py"}'}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "FileNotFoundError"},
+        {"role": "assistant", "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "bug.py"}'}}]},
+    ]
+
+    with pytest.raises(ToolPingPongError):
+        guard.check_request(messages, "gpt-4o", session_id="msg-history-session")
+
+
+
 
 

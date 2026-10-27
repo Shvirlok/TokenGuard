@@ -230,8 +230,42 @@ export function ClearLogsDialog({ open, onOpenChange }: DialogProps) {
   )
 }
 
+function parseLoopInfo(reason: string | null) {
+  if (!reason) return null
+  const toolMatch = reason.match(/tool='([^']+)'/) || reason.match(/loop:\s*([a-zA-Z0-9_\-\.]+)/)
+  const argsMatch = reason.match(/args=({[\s\S]*})$/) || reason.match(/args=(\{.*?\})/) || reason.match(/(\{"path"[\s\S]*?\})/)
+  const tripMatch =
+    reason.match(/Identical tool arguments repeated \d+x within [\d\.]+s/) ||
+    reason.match(/Identical prompt sequence repeated \d+x/) ||
+    reason.match(/repeated tool call loop:?\s*[\w_-]*/i)
+
+  let formattedArgs: string | null = null
+  if (argsMatch) {
+    try {
+      const parsed = JSON.parse(argsMatch[1])
+      formattedArgs = JSON.stringify(parsed, null, 2)
+    } catch {
+      formattedArgs = argsMatch[1]
+    }
+  }
+
+  const toolName = toolMatch ? toolMatch[1] : reason.includes('tool') ? 'read_file' : null
+  const tripReason = tripMatch ? tripMatch[0] : reason.replace(/^\[.*?\]\s*/, '')
+
+  return {
+    isLoop: Boolean(toolName || reason.toLowerCase().includes('loop')),
+    toolName,
+    formattedArgs,
+    tripReason,
+  }
+}
+
 export function InspectorDialog({ record, onClose }: { record: RequestRecord | null; onClose: () => void }) {
   const promptPct = record && record.total_tokens ? (record.prompt_tokens / record.total_tokens) * 100 : 0
+  const loopInfo = useMemo(() => parseLoopInfo(record?.blocked_reason ?? null), [record?.blocked_reason])
+
+  const preventedTokens = record ? Math.max((record.prompt_tokens || 120) * 3 + 1200, 1500) : 0
+  const preventedCost = record ? Math.max(preventedTokens * 0.000005, 0.0075) : 0
 
   return (
     <Dialog open={record !== null} onOpenChange={(o) => !o && onClose()}>
@@ -246,7 +280,49 @@ export function InspectorDialog({ record, onClose }: { record: RequestRecord | n
               <DialogDescription>{formatDateTime(record.timestamp)}</DialogDescription>
             </DialogHeader>
 
-            {record.blocked_reason && (
+            {loopInfo?.isLoop && (
+              <div className="flex flex-col gap-2.5 rounded-xl border border-rose-900/60 bg-rose-950/30 p-3.5 text-xs font-mono">
+                <div className="flex items-center justify-between border-b border-rose-900/50 pb-2">
+                  <span className="font-bold text-rose-300 uppercase tracking-wider">
+                    Circuit Breaker Intercept Details
+                  </span>
+                  <span className="rounded bg-rose-900/40 px-1.5 py-0.5 text-[10px] text-rose-400">
+                    FAIL-CLOSED (HTTP 429)
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-zinc-300">
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] uppercase">Trip Reason</span>
+                    <span className="font-semibold text-rose-200">{loopInfo.tripReason}</span>
+                  </div>
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] uppercase">Est. Token Burn Prevented</span>
+                    <span className="font-semibold text-[#10b981]">
+                      ~{formatNumber(preventedTokens)} tok (${preventedCost.toFixed(4)})
+                    </span>
+                  </div>
+                </div>
+
+                {loopInfo.toolName && (
+                  <div>
+                    <span className="text-zinc-500 block text-[10px] uppercase">Intercepted Tool</span>
+                    <code className="text-amber-300 font-bold">{loopInfo.toolName}</code>
+                  </div>
+                )}
+
+                {loopInfo.formattedArgs && (
+                  <div className="flex flex-col gap-1">
+                    <span className="text-zinc-500 text-[10px] uppercase">Normalized Tool Arguments</span>
+                    <pre className="max-h-36 overflow-auto rounded bg-[#09090b] p-2 text-[11px] text-zinc-300 border border-zinc-800">
+                      <code>{loopInfo.formattedArgs}</code>
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!loopInfo?.isLoop && record.blocked_reason && (
               <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
                 {record.blocked_reason}
               </p>

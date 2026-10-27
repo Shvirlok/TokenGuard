@@ -1,7 +1,14 @@
-export type RequestStatus = 'success' | 'blocked_loop' | 'blocked_budget' | 'blocked_killswitch'
+export type RequestStatus =
+  | 'success'
+  | 'blocked_loop'
+  | 'blocked_tool_loop'
+  | 'blocked_budget'
+  | 'blocked_killswitch'
+  | 'blocked_burn_rate'
+  | 'blocked_context_ballooning'
 export type StatusFilter = 'all' | 'success' | 'blocked'
 export type ProfileId = 'careful' | 'standard' | 'passive'
-export type SimulationType = 'loop' | 'success' | 'budget'
+export type SimulationType = 'loop' | 'tool_loop' | 'success' | 'budget'
 export type ExportFormat = 'csv' | 'json'
 
 export interface RequestRecord {
@@ -24,6 +31,7 @@ export interface Stats {
   blocked_requests: number
   blocked_budget_count: number
   blocked_loop_count: number
+  blocked_tool_loop_count?: number
   blocked_killswitch_count: number
   total_spent: number
   total_prompt_tokens: number
@@ -73,8 +81,18 @@ export interface LoopSimulationResult {
   results: { attempt: number; status: string }[]
 }
 
+export interface ToolLoopSimulationResult {
+  simulation: 'tool_loop'
+  tool_name?: string
+  arguments?: Record<string, unknown>
+  threshold: number
+  results: { attempt: number; status: string; message?: string; tool?: string }[]
+  intercepted?: boolean
+}
+
 export type SimulationResult =
   | LoopSimulationResult
+  | ToolLoopSimulationResult
   | { simulation: 'success'; model: string; cost: number }
   | { simulation: 'budget'; status: string }
 

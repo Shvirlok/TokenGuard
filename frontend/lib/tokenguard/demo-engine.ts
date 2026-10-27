@@ -224,6 +224,44 @@ class DemoEngine {
       })
       return { simulation: 'loop', threshold: this.loopThreshold, results }
     }
+    if (type === 'tool_loop') {
+      const toolName = 'read_file'
+      const toolArgs = { path: '/workspace/credentials.env' }
+      const attempts = Math.max(this.loopThreshold, 3)
+      const results = []
+      for (let i = 1; i <= attempts; i++) {
+        if (i < attempts) {
+          this.process('gpt-4o', 110, 80, randomHash(), 120 + i * 20, Date.now() + i)
+          results.push({ attempt: i, status: 'allowed', tool: toolName })
+        } else {
+          this.record({
+            t: Date.now() + i,
+            model: 'gpt-4o',
+            prompt_tokens: 110,
+            completion_tokens: 0,
+            cost_usd: 0,
+            latency_ms: 0,
+            prompt_hash: randomHash(),
+            status: 'blocked_tool_loop',
+            blocked_reason: `[TOOL RETRY LOOP: HARD STOP] Identical tool arguments repeated ${i}x within 4.2s: tool='${toolName}', args=${JSON.stringify(toolArgs)}`,
+          })
+          results.push({
+            attempt: i,
+            status: 'blocked_tool_loop',
+            tool: toolName,
+            message: `[TOOL RETRY LOOP: HARD STOP] Intercepted repeated tool call loop: ${toolName}`,
+          })
+        }
+      }
+      return {
+        simulation: 'tool_loop',
+        tool_name: toolName,
+        arguments: toolArgs,
+        threshold: this.loopThreshold,
+        results,
+        intercepted: true,
+      }
+    }
     if (type === 'success') {
       const rec = this.process('gpt-4o', 85, 140, randomHash(), 210)
       return { simulation: 'success', model: rec.model, cost: rec.cost_usd }

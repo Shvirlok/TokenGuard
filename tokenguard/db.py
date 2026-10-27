@@ -127,7 +127,8 @@ async def get_metrics(
                 COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_requests,
                 COALESCE(SUM(CASE WHEN status LIKE 'blocked%' THEN 1 ELSE 0 END), 0) AS blocked_requests,
                 COALESCE(SUM(CASE WHEN status = 'blocked_budget' THEN 1 ELSE 0 END), 0) AS blocked_budget_count,
-                COALESCE(SUM(CASE WHEN status = 'blocked_loop' THEN 1 ELSE 0 END), 0) AS blocked_loop_count,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop') THEN 1 ELSE 0 END), 0) AS blocked_loop_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_tool_loop' THEN 1 ELSE 0 END), 0) AS blocked_tool_loop_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_killswitch' THEN 1 ELSE 0 END), 0) AS blocked_killswitch_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_burn_rate' THEN 1 ELSE 0 END), 0) AS blocked_burn_rate_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_context_ballooning' THEN 1 ELSE 0 END), 0) AS blocked_context_ballooning_count,
@@ -148,7 +149,8 @@ async def get_metrics(
                 COUNT(*) AS all_time_total_requests,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN cost_usd ELSE 0.0 END), 0.0) AS all_time_spent,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN prompt_tokens + completion_tokens ELSE 0 END), 0) AS all_time_tokens,
-                COALESCE(SUM(CASE WHEN status = 'blocked_loop' THEN 1 ELSE 0 END), 0) AS all_time_blocked_loops,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop') THEN 1 ELSE 0 END), 0) AS all_time_blocked_loops,
+                COALESCE(SUM(CASE WHEN status = 'blocked_tool_loop' THEN 1 ELSE 0 END), 0) AS all_time_blocked_tool_loops,
                 COALESCE(SUM(CASE WHEN status = 'blocked_budget' THEN 1 ELSE 0 END), 0) AS all_time_blocked_budget,
                 COALESCE(SUM(CASE WHEN status LIKE 'blocked%' THEN 1 ELSE 0 END), 0) AS all_time_blocked_total
             FROM requests

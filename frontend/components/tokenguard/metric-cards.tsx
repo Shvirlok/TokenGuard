@@ -16,7 +16,6 @@ export function MetricCards() {
 
   return (
     <div className="grid grid-cols-3 gap-2 font-mono">
-      {/* 1. Active Streams (passthrough count) */}
       <div className="flex flex-col justify-between rounded border border-[#27272a] bg-[#101012] px-3.5 py-2.5">
         <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-zinc-400">
           <span>Active Streams</span>
@@ -35,7 +34,6 @@ export function MetricCards() {
         </div>
       </div>
 
-      {/* 2. Loops Intercepted (count of blocked identical retry loops) */}
       <div className="flex flex-col justify-between rounded border border-[#27272a] bg-[#101012] px-3.5 py-2.5">
         <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-zinc-400">
           <span>Loops Intercepted</span>
@@ -53,7 +51,6 @@ export function MetricCards() {
         </div>
       </div>
 
-      {/* 3. Est. Budget Preserved (calculated USD saved) */}
       <div className="flex flex-col justify-between rounded border border-[#27272a] bg-[#101012] px-3.5 py-2.5">
         <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-zinc-400">
           <span>Est. Budget Preserved</span>
@@ -73,3 +70,4 @@ export function MetricCards() {
     </div>
   )
 }
+
