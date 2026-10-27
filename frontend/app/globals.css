@@ -31,92 +31,87 @@
   --color-success: var(--success);
   --color-info: var(--info);
 
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) * 1.4);
-  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-sm: 0.1875rem;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.375rem;
+  --radius-xl: 0.5rem;
+  --radius-2xl: 0.625rem;
 }
 
 :root {
-  color-scheme: light;
-  --background: #f5f6fa;
-  --foreground: #0f172a;
-  --card: #ffffff;
-  --card-foreground: #0f172a;
-  --popover: #ffffff;
-  --popover-foreground: #0f172a;
-  --primary: #4f46e5;
-  --primary-foreground: #ffffff;
-  --secondary: #eef0f6;
-  --secondary-foreground: #0f172a;
-  --muted: #eef0f6;
-  --muted-foreground: #5b6478;
-  --accent: #eef0f6;
-  --accent-foreground: #0f172a;
-  --destructive: #e11d48;
-  --warning: #b45309;
-  --success: #059669;
-  --info: #0891b2;
-  --terminal: #f8f9fc;
-  --border: #e2e5ee;
-  --input: #e2e5ee;
-  --ring: #4f46e5;
-  --radius: 0.625rem;
+  color-scheme: dark;
+  --background: #09090b;
+  --foreground: #e4e4e7;
+  --card: #101012;
+  --card-foreground: #e4e4e7;
+  --popover: #101012;
+  --popover-foreground: #e4e4e7;
+  --primary: #e4e4e7;
+  --primary-foreground: #09090b;
+  --secondary: #18181b;
+  --secondary-foreground: #e4e4e7;
+  --muted: #18181b;
+  --muted-foreground: #71717a;
+  --accent: #18181b;
+  --accent-foreground: #e4e4e7;
+  --destructive: #f43f5e;
+  --warning: #f59e0b;
+  --success: #10b981;
+  --info: #38bdf8;
+  --terminal: #09090b;
+  --border: #27272a;
+  --input: #27272a;
+  --ring: #27272a;
+  --radius: 0.375rem;
 }
 
 .dark {
   color-scheme: dark;
-  --background: #070910;
-  --foreground: #e8eaf2;
-  --card: #0d1120;
-  --card-foreground: #e8eaf2;
-  --popover: #0d1120;
-  --popover-foreground: #e8eaf2;
-  --primary: #6366f1;
-  --primary-foreground: #ffffff;
-  --secondary: #161b2e;
-  --secondary-foreground: #e8eaf2;
-  --muted: #161b2e;
-  --muted-foreground: #8b93ab;
-  --accent: #161b2e;
-  --accent-foreground: #e8eaf2;
+  --background: #09090b;
+  --foreground: #e4e4e7;
+  --card: #101012;
+  --card-foreground: #e4e4e7;
+  --popover: #101012;
+  --popover-foreground: #e4e4e7;
+  --primary: #e4e4e7;
+  --primary-foreground: #09090b;
+  --secondary: #18181b;
+  --secondary-foreground: #e4e4e7;
+  --muted: #18181b;
+  --muted-foreground: #71717a;
+  --accent: #18181b;
+  --accent-foreground: #e4e4e7;
   --destructive: #f43f5e;
-  --warning: #f5b03b;
-  --success: #34d399;
-  --info: #22d3ee;
-  --terminal: #080b16;
-  --border: #1d2338;
-  --input: #1d2338;
-  --ring: #6366f1;
+  --warning: #f59e0b;
+  --success: #10b981;
+  --info: #38bdf8;
+  --terminal: #09090b;
+  --border: #27272a;
+  --input: #27272a;
+  --ring: #27272a;
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
-  body {
-    @apply bg-background text-foreground;
+  html, body {
+    @apply bg-background text-foreground h-screen max-h-screen overflow-hidden;
   }
 }
 
-@keyframes row-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+/* Custom sleek scrollbar for CLI/terminal HUD */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
 }
-
-.animate-row-in {
-  animation: row-in 0.35s ease-out both;
+::-webkit-scrollbar-track {
+  background: transparent;
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .animate-row-in {
-    animation: none;
-  }
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
 }

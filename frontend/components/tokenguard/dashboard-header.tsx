@@ -1,144 +1,134 @@
 'use client'
 
-import { Ban, Code2, Power, ReceiptText, ShieldCheck, SlidersHorizontal, Volume2, VolumeX, Zap } from 'lucide-react'
-import { ThemeToggle } from '@/components/theme-toggle'
+import { ExternalLink, Power, Shield, SlidersHorizontal, Volume2, VolumeX } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { useTokenGuard } from './provider'
 
 interface DashboardHeaderProps {
-  onOpenSnippets: () => void
-  onOpenConfig: () => void
-  onOpenPricing: () => void
+  onOpenConfig?: () => void
 }
 
-function IconButton({
-  label,
-  onClick,
-  children,
-  active,
-}: {
-  label: string
-  onClick: () => void
-  children: React.ReactNode
-  active?: boolean
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <button
-            type="button"
-            onClick={onClick}
-            aria-label={label}
-            aria-pressed={active}
-            className={cn(
-              'flex size-9 items-center justify-center rounded-xl border bg-card text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground',
-              active && 'border-primary/50 text-primary',
-            )}
-          />
-        }
-      >
-        {children}
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
-  )
-}
-
-export function DashboardHeader({ onOpenSnippets, onOpenConfig, onOpenPricing }: DashboardHeaderProps) {
-  const { stats, polling, mode, pending, simulate, toggleKillSwitch, soundEnabled, setSoundEnabled } = useTokenGuard()
+export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
+  const { stats, mode, baseUrl, pending, toggleKillSwitch, soundEnabled, setSoundEnabled } = useTokenGuard()
   const killed = Boolean(stats?.kill_switch_active)
-  const state = killed ? 'killed' : !polling ? 'paused' : 'guarding'
 
-  const pill = {
-    guarding: { label: 'Guarding', className: 'border-success/40 bg-success/10 text-success', dot: 'bg-success' },
-    paused: { label: 'Paused', className: 'border-warning/40 bg-warning/10 text-warning', dot: 'bg-warning' },
-    killed: {
-      label: 'Killed',
-      className: 'border-destructive/50 bg-destructive/10 text-destructive shadow-[0_0_24px_-6px] shadow-destructive/60',
-      dot: 'bg-destructive',
-    },
-  }[state]
+  // Determine socket address
+  const socketAddress = baseUrl
+    ? baseUrl.replace(/^https?:\/\//, '')
+    : '127.0.0.1:8080'
 
   return (
-    <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur-xl">
-      <div className="mx-auto flex h-16 max-w-7xl items-center gap-3 px-4 sm:px-6">
-        <div className="flex items-center gap-2.5">
-          <div className="flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-lg shadow-primary/30">
-            <ShieldCheck className="size-5" aria-hidden="true" />
+    <header className="flex h-11 shrink-0 items-center justify-between border-b border-[#27272a] bg-[#101012] px-3 font-mono">
+      {/* Left: App Title, Version, Social Proof Badge */}
+      <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-1.5">
+          <div className="flex size-5 items-center justify-center rounded bg-[#18181b] border border-[#27272a] text-zinc-300">
+            <Shield className="size-3 text-zinc-300" />
           </div>
-          <span className="hidden text-sm font-semibold tracking-tight md:inline">TokenGuard</span>
+          <span className="text-xs font-bold tracking-tight text-zinc-100 uppercase">TokenGuard</span>
+          <span className="rounded border border-[#27272a] bg-[#18181b] px-1.5 py-0.5 text-[10px] text-zinc-400">
+            v0.1.4
+          </span>
         </div>
 
-        <div
-          role="status"
-          aria-live="polite"
+        <div className="h-3.5 w-px bg-[#27272a]" />
+
+        {/* Social Proof Badge */}
+        <a
+          href="https://github.com/xerj-org/xerj"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1.5 rounded border border-[#27272a] bg-[#121215] px-2 py-0.5 text-[11px] text-zinc-400 transition-colors hover:border-zinc-700 hover:text-zinc-200"
+          title="Indexed in XERJ Corpus Hub"
+        >
+          <span>Indexed in XERJ Corpus Hub</span>
+          <ExternalLink className="size-2.5 opacity-60" />
+        </a>
+      </div>
+
+      {/* Right: Socket Indicator + Hardware Kill Switch */}
+      <div className="flex items-center gap-3">
+        {/* Proxy Socket Indicator */}
+        <div className="flex items-center gap-2 text-[11px]">
+          <span
+            className={cn(
+              'size-2 rounded-full',
+              mode === 'live'
+                ? 'bg-[#10b981]'
+                : mode === 'demo'
+                  ? 'bg-[#10b981]'
+                  : 'bg-zinc-600 animate-pulse'
+            )}
+            aria-hidden="true"
+          />
+          <span className="tracking-wide text-zinc-300 font-medium">
+            {mode === 'connecting' ? 'CONNECTING…' : `LIVE ON ${socketAddress}`}
+          </span>
+        </div>
+
+        <div className="h-3.5 w-px bg-[#27272a]" />
+
+        {/* Hardware-style KILL SWITCH button */}
+        <button
+          type="button"
+          onClick={toggleKillSwitch}
+          disabled={mode === 'connecting' || pending === 'kill'}
           className={cn(
-            'flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider transition-colors',
-            pill.className,
+            'inline-flex h-7 items-center gap-1.5 rounded border px-2.5 text-[11px] font-semibold tracking-wider uppercase transition-all disabled:opacity-50 select-none cursor-pointer',
+            killed
+              ? 'border-rose-500 bg-rose-950/40 text-rose-400 hover:bg-rose-900/50'
+              : 'border-[#3f3f46] bg-[#18181b] text-zinc-300 hover:border-rose-700 hover:bg-rose-950/20 hover:text-rose-400'
           )}
         >
-          <span className="relative flex size-2">
-            {state !== 'paused' && (
-              <span className={cn('absolute inline-flex size-full animate-ping rounded-full opacity-70', pill.dot)} />
-            )}
-            <span className={cn('relative inline-flex size-2 rounded-full', pill.dot)} />
-          </span>
-          {pill.label}
-        </div>
+          <Power className={cn('size-3', killed ? 'text-rose-400 animate-pulse' : 'text-zinc-500')} />
+          <span>{killed ? 'KILL SWITCH: ENGAGED' : 'KILL SWITCH'}</span>
+        </button>
 
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => simulate('loop')}
-            disabled={mode === 'connecting' || pending === 'sim:loop'}
-            className="hidden h-9 items-center gap-1.5 rounded-xl border border-info/40 bg-info/10 px-3 text-xs font-semibold text-info transition-colors hover:bg-info/20 disabled:opacity-50 sm:flex"
-          >
-            <Zap className="size-3.5" aria-hidden="true" />
-            Test Breaker
-          </button>
-          <button
-            type="button"
-            onClick={toggleKillSwitch}
-            disabled={mode === 'connecting' || pending === 'kill'}
-            className={cn(
-              'flex h-9 items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold transition-colors disabled:opacity-50',
-              killed
-                ? 'border-success/40 bg-success/10 text-success hover:bg-success/20'
-                : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20',
-            )}
-          >
-            {killed ? <Power className="size-3.5" aria-hidden="true" /> : <Ban className="size-3.5" aria-hidden="true" />}
-            <span className="hidden sm:inline">{killed ? 'Resume All Requests' : 'Kill All Requests'}</span>
-            <span className="sm:hidden">{killed ? 'Resume' : 'Kill'}</span>
-          </button>
+        {/* Quick controls */}
+        <div className="flex items-center gap-1">
+          {onOpenConfig && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    onClick={onOpenConfig}
+                    aria-label="Guard Limits"
+                    className="flex size-7 items-center justify-center rounded border border-[#27272a] bg-[#141416] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200 cursor-pointer"
+                  />
+                }
+              >
+                <SlidersHorizontal className="size-3" />
+              </TooltipTrigger>
+              <TooltipContent className="font-mono text-[10px] bg-[#101012] border border-[#27272a] text-zinc-300">
+                Guard Limits
+              </TooltipContent>
+            </Tooltip>
+          )}
 
-          <div className="mx-1 hidden h-6 w-px bg-border sm:block" aria-hidden="true" />
-
-          <div className="hidden items-center gap-2 md:flex">
-            <IconButton label="Integration snippets" onClick={onOpenSnippets}>
-              <Code2 className="size-4" aria-hidden="true" />
-            </IconButton>
-            <IconButton label="Guard limits" onClick={onOpenConfig}>
-              <SlidersHorizontal className="size-4" aria-hidden="true" />
-            </IconButton>
-            <IconButton label="Model pricing" onClick={onOpenPricing}>
-              <ReceiptText className="size-4" aria-hidden="true" />
-            </IconButton>
-          </div>
-          <IconButton
-            label={soundEnabled ? 'Mute block alerts' : 'Enable block alerts'}
-            onClick={() => setSoundEnabled(!soundEnabled)}
-            active={soundEnabled}
-          >
-            {soundEnabled ? (
-              <Volume2 className="size-4" aria-hidden="true" />
-            ) : (
-              <VolumeX className="size-4" aria-hidden="true" />
-            )}
-          </IconButton>
-          <ThemeToggle />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  onClick={() => setSoundEnabled(!soundEnabled)}
+                  aria-label={soundEnabled ? 'Mute Alerts' : 'Unmute Alerts'}
+                  className={cn(
+                    'flex size-7 items-center justify-center rounded border transition-colors cursor-pointer',
+                    soundEnabled
+                      ? 'border-[#10b981]/50 bg-[#10b981]/10 text-[#10b981]'
+                      : 'border-[#27272a] bg-[#141416] text-zinc-500 hover:text-zinc-300'
+                  )}
+                />
+              }
+            >
+              {soundEnabled ? <Volume2 className="size-3" /> : <VolumeX className="size-3" />}
+            </TooltipTrigger>
+            <TooltipContent className="font-mono text-[10px] bg-[#101012] border border-[#27272a] text-zinc-300">
+              {soundEnabled ? 'Audio Alerts: ON' : 'Audio Alerts: MUTED'}
+            </TooltipContent>
+          </Tooltip>
         </div>
       </div>
     </header>

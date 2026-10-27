@@ -1,196 +1,170 @@
 'use client'
 
-import { ArrowRight, Check, Code2, Loader2, ReceiptText, SlidersHorizontal, Zap } from 'lucide-react'
-import { DEFAULT_PROXY_URL, PROFILES, type ProfileDefinition } from '@/lib/tokenguard/constants'
+import { Check, Copy, ShieldAlert, Sliders } from 'lucide-react'
+import { useState } from 'react'
+import { PROFILES } from '@/lib/tokenguard/constants'
 import { cn } from '@/lib/utils'
-import { CopyButton } from './copy-button'
 import { useTokenGuard } from './provider'
 
-const ACCENTS: Record<ProfileDefinition['accent'], { dot: string; text: string; active: string; tag: string; cta: string }> = {
-  success: {
-    dot: 'bg-success',
-    text: 'text-success',
-    active: 'border-success/70 shadow-[0_0_40px_-12px] shadow-success/50',
-    tag: 'border-success/30 bg-success/10 text-success',
-    cta: 'border-success/50 bg-success/15 text-success',
-  },
-  warning: {
-    dot: 'bg-warning',
-    text: 'text-warning',
-    active: 'border-warning/70 shadow-[0_0_40px_-12px] shadow-warning/50',
-    tag: 'border-warning/30 bg-warning/10 text-warning',
-    cta: 'border-warning/50 bg-warning/15 text-warning',
-  },
-  info: {
-    dot: 'bg-info',
-    text: 'text-info',
-    active: 'border-info/70 shadow-[0_0_40px_-12px] shadow-info/50',
-    tag: 'border-info/30 bg-info/10 text-info',
-    cta: 'border-info/50 bg-info/15 text-info',
-  },
-}
-
-function StepLabel({ n, children }: { n: number; children: React.ReactNode }) {
-  return (
-    <h3 className="flex items-center gap-3 text-sm font-semibold uppercase tracking-wider">
-      <span className="flex size-7 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
-        {n}
-      </span>
-      {children}
-    </h3>
-  )
-}
-
 interface ProtectionPanelProps {
-  onOpenSnippets: () => void
-  onOpenConfig: () => void
-  onOpenPricing: () => void
+  onOpenConfig?: () => void
 }
 
-export function ProtectionPanel({ onOpenSnippets, onOpenConfig, onOpenPricing }: ProtectionPanelProps) {
-  const { stats, pending, mode, baseUrl, simulate, setProfile } = useTokenGuard()
-  const proxyUrl = `${baseUrl || DEFAULT_PROXY_URL}/v1`
-  const command = 'tokenguard run python my_agent.py'
+type TabType = 'python' | 'bash' | 'typescript'
+
+const SNIPPETS: Record<TabType, { label: string; code: string }> = {
+  python: {
+    label: 'Python',
+    code: `from openai import OpenAI
+
+# Route agent traffic through TokenGuard circuit breaker
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="tg-proxy"  # or OPENAI_API_KEY
+)
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Execute agent workflow..."}]
+)`,
+  },
+  bash: {
+    label: 'Bash / Env',
+    code: `# Route any OpenAI-compatible SDK / CLI:
+export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
+
+# Or execute with automatic process wrapper:
+tokenguard run python my_agent.py`,
+  },
+  typescript: {
+    label: 'TypeScript',
+    code: `import OpenAI from "openai";
+
+// Route agent traffic through TokenGuard circuit breaker
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:8080/v1",
+});
+
+const response = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [{ role: "user", content: "Execute agent workflow..." }],
+});`,
+  },
+}
+
+export function ProtectionPanel({ onOpenConfig }: ProtectionPanelProps) {
+  const { stats, setProfile, pending } = useTokenGuard()
+  const [activeTab, setActiveTab] = useState<TabType>('python')
+  const [copied, setCopied] = useState(false)
+
+  const activeSnippet = SNIPPETS[activeTab]
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(activeSnippet.code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    } catch {
+      // fallback
+    }
+  }
 
   return (
     <section
-      aria-labelledby="protection-title"
-      className="relative overflow-hidden rounded-3xl border bg-card p-5 sm:p-8"
+      aria-label="Agent Config Snippets & Policy"
+      className="flex h-full min-h-0 flex-col rounded border border-[#27272a] bg-[#101012] font-mono text-xs"
     >
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute -top-40 left-1/2 h-80 w-[60rem] -translate-x-1/2 rounded-full bg-primary/15 blur-3xl"
-      />
-      <div className="relative flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
-        <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="rounded-full border border-primary/40 bg-primary/10 px-3 py-0.5 text-[11px] font-semibold uppercase tracking-widest text-primary">
-              Guard profiles
-            </span>
-            <h2 id="protection-title" className="text-2xl font-bold tracking-tight text-balance sm:text-3xl">
-              Active Protection & Controls
-            </h2>
-          </div>
-          <p className="max-w-xl text-sm text-muted-foreground text-pretty">
-            Choose your active guard profile below, or launch protected scripts with zero manual config.
-          </p>
+      {/* Header & Tabs */}
+      <div className="flex shrink-0 items-center justify-between border-b border-[#27272a] px-3 py-2">
+        <div className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-zinc-200">
+          <span className="size-2 rounded-full bg-[#10b981]" />
+          <span>Agent Config Snippets</span>
         </div>
+
+        {/* 1-Click Copy Button */}
         <button
           type="button"
-          onClick={() => simulate('loop')}
-          disabled={mode === 'connecting' || pending === 'sim:loop'}
-          className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-linear-to-r from-primary to-info px-5 text-sm font-semibold text-white shadow-lg shadow-primary/30 transition-transform hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-60"
+          onClick={handleCopy}
+          className="inline-flex h-6 items-center gap-1.5 rounded border border-[#3f3f46] bg-[#18181b] px-2 text-[10px] font-semibold tracking-wider uppercase text-zinc-200 transition-colors hover:border-zinc-500 hover:text-white cursor-pointer select-none"
         >
-          {pending === 'sim:loop' ? (
-            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-          ) : (
-            <Zap className="size-4" aria-hidden="true" />
-          )}
-          Run Instant Simulation
-          <span className="font-normal opacity-80">(no API key needed)</span>
+          {copied ? <Check className="size-2.5 text-[#10b981]" /> : <Copy className="size-2.5" />}
+          <span>{copied ? 'COPIED' : 'COPY CODE'}</span>
         </button>
       </div>
 
-      <div className="relative my-6 h-px bg-border sm:my-8" />
+      {/* Language Tab Selector */}
+      <div className="flex shrink-0 border-b border-[#27272a] bg-[#141416] px-2 text-[11px]">
+        {(['python', 'bash', 'typescript'] as TabType[]).map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setActiveTab(tab)}
+            className={cn(
+              'border-b-2 px-3 py-1.5 font-medium transition-colors cursor-pointer',
+              activeTab === tab
+                ? 'border-zinc-200 text-zinc-100 font-semibold'
+                : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            )}
+          >
+            {SNIPPETS[tab].label}
+          </button>
+        ))}
+      </div>
 
-      <div className="relative grid gap-8 lg:grid-cols-5">
-        <div className="flex flex-col gap-4 lg:col-span-3">
-          <StepLabel n={1}>Choose guard profile</StepLabel>
-          <div role="radiogroup" aria-label="Guard profile" className="grid gap-3 sm:grid-cols-3">
-            {PROFILES.map((profile) => {
-              const accent = ACCENTS[profile.accent]
-              const active = stats?.active_profile === profile.id
-              const loading = pending === `profile:${profile.id}`
-              return (
-                <button
-                  key={profile.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  disabled={!stats || loading}
-                  onClick={() => !active && setProfile(profile.id)}
-                  className={cn(
-                    'group flex flex-col gap-3 rounded-2xl border-2 bg-background/60 p-4 text-left transition-all',
-                    active ? accent.active : 'border-border hover:border-muted-foreground/40',
-                  )}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className={cn('size-2.5 rounded-full', accent.dot)} aria-hidden="true" />
-                    {active && (
-                      <span className={cn('flex items-center gap-1 text-xs font-semibold', accent.text)}>
-                        <Check className="size-3.5" aria-hidden="true" />
-                        Active
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <span className="font-semibold">{profile.name}</span>
-                    <span className="text-xs leading-relaxed text-muted-foreground">{profile.description}</span>
-                  </div>
-                  <span className={cn('w-fit rounded-md border px-2 py-0.5 font-mono text-[10px]', accent.tag)}>
-                    {profile.tag}
-                  </span>
-                  <span
-                    className={cn(
-                      'mt-auto flex h-9 items-center justify-center gap-1.5 rounded-lg border text-xs font-semibold transition-colors',
-                      active ? accent.cta : 'bg-secondary text-secondary-foreground group-hover:bg-muted',
-                    )}
-                  >
-                    {loading ? (
-                      <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-                    ) : active ? (
-                      <Check className="size-3.5" aria-hidden="true" />
-                    ) : null}
-                    {active ? 'Active Plan' : 'Switch to Plan'}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
+      {/* Code Snippet Box */}
+      <div className="flex-1 min-h-0 overflow-y-auto bg-[#09090b] p-3 text-zinc-300">
+        <pre className="text-[11px] leading-relaxed font-mono whitespace-pre select-text">
+          <code>{activeSnippet.code}</code>
+        </pre>
+      </div>
+
+      {/* Guard Policy HUD Bar */}
+      <div className="shrink-0 border-t border-[#27272a] bg-[#101012] p-2.5">
+        <div className="mb-2 flex items-center justify-between text-[10px] uppercase text-zinc-400">
+          <span className="flex items-center gap-1">
+            <ShieldAlert className="size-3 text-zinc-400" />
+            <span>Active Circuit Breaker Profile</span>
+          </span>
+          {onOpenConfig && (
+            <button
+              type="button"
+              onClick={onOpenConfig}
+              className="inline-flex items-center gap-1 text-[10px] text-zinc-400 hover:text-zinc-200 cursor-pointer"
+            >
+              <Sliders className="size-2.5" />
+              <span>EDIT LIMITS</span>
+            </button>
+          )}
         </div>
 
-        <div className="flex flex-col gap-4 lg:col-span-2">
-          <StepLabel n={2}>Launch protected</StepLabel>
-          <div className="flex flex-1 flex-col gap-4 rounded-2xl border bg-terminal p-4 sm:p-5">
-            <p className="text-sm text-muted-foreground">Run your existing Python agent through TokenGuard:</p>
-            <div className="flex items-center gap-3 rounded-xl border bg-background/50 py-2 pr-2 pl-4">
-              <code className="min-w-0 flex-1 truncate font-mono text-sm text-success">
-                <span className="text-muted-foreground select-none">$ </span>
-                {command}
-              </code>
-              <CopyButton value={command} />
-            </div>
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-              <span>
-                Or configure proxy: <code className="font-mono text-primary">{proxyUrl}</code>
-              </span>
+        <div className="grid grid-cols-3 gap-1.5">
+          {PROFILES.map((p) => {
+            const isActive = (stats?.active_profile ?? 'careful') === p.id
+            const isLoading = pending === `profile:${p.id}`
+
+            return (
               <button
+                key={p.id}
                 type="button"
-                onClick={onOpenSnippets}
-                className="inline-flex items-center gap-1 font-medium text-primary underline-offset-4 hover:underline"
+                disabled={isLoading}
+                onClick={() => !isActive && setProfile(p.id)}
+                className={cn(
+                  'flex flex-col items-start rounded border p-1.5 text-left transition-colors cursor-pointer select-none',
+                  isActive
+                    ? 'border-[#10b981]/70 bg-[#10b981]/10 text-zinc-100'
+                    : 'border-[#27272a] bg-[#141416] text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                )}
               >
-                More snippets
-                <ArrowRight className="size-3" aria-hidden="true" />
+                <div className="flex w-full items-center justify-between text-[10px] font-bold uppercase">
+                  <span>{p.name}</span>
+                  {isActive && <span className="size-1.5 rounded-full bg-[#10b981]" />}
+                </div>
+                <span className="text-[9px] text-zinc-500 mt-0.5 truncate w-full">
+                  ${p.hourly_limit}/hr · {p.loop_threshold > 0 ? `${p.loop_threshold}x cut` : 'monitor'}
+                </span>
               </button>
-            </div>
-            <div className="mt-auto grid grid-cols-3 gap-2 border-t pt-4 md:hidden">
-              {[
-                { label: 'Snippets', Icon: Code2, onClick: onOpenSnippets },
-                { label: 'Limits', Icon: SlidersHorizontal, onClick: onOpenConfig },
-                { label: 'Pricing', Icon: ReceiptText, onClick: onOpenPricing },
-              ].map(({ label, Icon, onClick }) => (
-                <button
-                  key={label}
-                  type="button"
-                  onClick={onClick}
-                  className="flex h-9 items-center justify-center gap-1.5 rounded-lg border bg-card text-xs font-medium"
-                >
-                  <Icon className="size-3.5" aria-hidden="true" />
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
+            )
+          })}
         </div>
       </div>
     </section>
