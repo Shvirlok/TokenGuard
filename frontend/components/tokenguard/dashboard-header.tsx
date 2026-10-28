@@ -28,7 +28,7 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
           </div>
           <span className="text-xs font-bold tracking-tight text-zinc-100 uppercase">TokenGuard</span>
           <span className="rounded border border-[#27272a] bg-[#18181b] px-1.5 py-0.5 text-[10px] text-zinc-400">
-            v0.1.4
+            v0.2.0
           </span>
         </div>
 

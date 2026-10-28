@@ -140,6 +140,11 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
               const isLoopBlocked =
                 r.status === 'blocked_loop' ||
                 (!isToolLoopBlocked && Boolean(r.blocked_reason?.toLowerCase().includes('loop')))
+              const isBurnRateBlocked =
+                r.status === 'blocked_burn_rate' || Boolean(r.blocked_reason?.toLowerCase().includes('burn rate'))
+              const isContextBallooningBlocked =
+                r.status === 'blocked_context_ballooning' ||
+                Boolean(r.blocked_reason?.toLowerCase().includes('context ballooning'))
               const isBudgetBlocked = r.status === 'blocked_budget'
               const isKilled = r.status === 'blocked_killswitch'
               const isSuccess = r.status === 'success'
@@ -150,7 +155,8 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
                   onClick={() => onInspect(r)}
                   className={cn(
                     'group cursor-pointer transition-colors hover:bg-[#18181b]/80 select-none',
-                    (isToolLoopBlocked || isLoopBlocked) && 'bg-rose-950/20 hover:bg-rose-950/30'
+                    (isToolLoopBlocked || isLoopBlocked || isBurnRateBlocked || isContextBallooningBlocked) &&
+                      'bg-rose-950/20 hover:bg-rose-950/30'
                   )}
                 >
                   <td className="py-1.5 pl-3 pr-2 text-zinc-500 whitespace-nowrap">
@@ -174,6 +180,16 @@ export function RequestsTable({ onInspect, onClearLogs }: RequestsTableProps) {
                       <span className="inline-flex items-center gap-1.5 rounded border border-rose-500/80 bg-rose-950/60 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-rose-300">
                         <span className="size-1.5 rounded-full bg-rose-500 animate-pulse" />
                         [CIRCUIT BREAKER: HARD STOP]
+                      </span>
+                    ) : isBurnRateBlocked ? (
+                      <span className="inline-flex items-center gap-1.5 rounded border border-amber-500/80 bg-amber-950/60 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-amber-300">
+                        <span className="size-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        [BURN RATE SPIKE: 429]
+                      </span>
+                    ) : isContextBallooningBlocked ? (
+                      <span className="inline-flex items-center gap-1.5 rounded border border-rose-500/80 bg-rose-950/60 px-1.5 py-0.5 text-[10px] font-bold tracking-wider text-rose-300">
+                        <span className="size-1.5 rounded-full bg-rose-500 animate-pulse" />
+                        [CONTEXT RUNAWAY: 429]
                       </span>
                     ) : isBudgetBlocked ? (
                       <span className="inline-flex items-center gap-1 rounded border border-amber-900/60 bg-amber-950/30 px-1.5 py-0.5 text-[10px] text-amber-400">

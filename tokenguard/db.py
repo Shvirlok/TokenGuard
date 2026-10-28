@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS requests (
     latency_ms INTEGER DEFAULT 0,
     prompt_hash TEXT,
     status TEXT NOT NULL,
-    blocked_reason TEXT
+    blocked_reason TEXT,
+    session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
@@ -62,6 +63,12 @@ async def init_db(db_path: Union[str, Path]) -> None:
     """Initialize SQLite database tables and indexes."""
     async with get_db(db_path) as db:
         await db.executescript(SCHEMA_SQL)
+        # Migrate existing tables if session_id column was not present
+        try:
+            await db.execute("ALTER TABLE requests ADD COLUMN session_id TEXT;")
+        except Exception:
+            pass
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);")
         await db.commit()
 
 
@@ -76,6 +83,7 @@ async def log_request(
     status: str = "success",
     blocked_reason: Optional[str] = None,
     timestamp: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> int:
     """Log an LLM request or blocked intercept to SQLite.
 
@@ -89,8 +97,9 @@ async def log_request(
             """
             INSERT INTO requests (
                 timestamp, model, prompt_tokens, completion_tokens,
-                cost_usd, latency_ms, prompt_hash, status, blocked_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                session_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -102,6 +111,7 @@ async def log_request(
                 prompt_hash,
                 status,
                 blocked_reason,
+                session_id,
             ),
         )
         await db.commit()
@@ -216,7 +226,8 @@ async def get_recent_requests(
             if status_filter == "blocked":
                 query = """
                     SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                           cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
                     FROM requests
                     WHERE status LIKE 'blocked%'
                     ORDER BY id DESC
@@ -226,7 +237,8 @@ async def get_recent_requests(
             else:
                 query = """
                     SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                           cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
                     FROM requests
                     WHERE status = ?
                     ORDER BY id DESC
@@ -236,7 +248,8 @@ async def get_recent_requests(
         else:
             query = """
                 SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                       cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                       cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                       session_id
                 FROM requests
                 ORDER BY id DESC
                 LIMIT ? OFFSET ?
@@ -258,6 +271,7 @@ async def get_recent_requests(
                     "prompt_hash": row["prompt_hash"],
                     "status": row["status"],
                     "blocked_reason": row["blocked_reason"],
+                    "session_id": row["session_id"],
                 }
                 for row in rows
             ]
@@ -333,7 +347,8 @@ async def get_all_requests_for_export(
             if status_filter == "blocked":
                 query = """
                     SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                           cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
                     FROM requests
                     WHERE status LIKE 'blocked%'
                     ORDER BY id ASC
@@ -342,7 +357,8 @@ async def get_all_requests_for_export(
             else:
                 query = """
                     SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                           cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
                     FROM requests
                     WHERE status = ?
                     ORDER BY id ASC
@@ -351,7 +367,8 @@ async def get_all_requests_for_export(
         else:
             query = """
                 SELECT id, timestamp, model, prompt_tokens, completion_tokens,
-                       cost_usd, latency_ms, prompt_hash, status, blocked_reason
+                       cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                       session_id
                 FROM requests
                 ORDER BY id ASC
             """
@@ -372,6 +389,7 @@ async def get_all_requests_for_export(
                     "prompt_hash": row["prompt_hash"],
                     "status": row["status"],
                     "blocked_reason": row["blocked_reason"] or "",
+                    "session_id": row["session_id"] or "",
                 }
                 for row in rows
             ]

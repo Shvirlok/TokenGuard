@@ -71,7 +71,7 @@ def format_har_export(
                     {"name": "Host", "value": f"{host}:{port}"},
                     {"name": "Content-Type", "value": "application/json"},
                     {"name": "Accept", "value": "application/json"},
-                    {"name": "User-Agent", "value": "TokenGuard-Proxy/0.1.0"},
+                    {"name": "User-Agent", "value": "TokenGuard-Proxy/0.2.0"},
                 ],
                 "queryString": [],
                 "postData": {
@@ -126,7 +126,7 @@ def format_har_export(
             "version": "1.2",
             "creator": {
                 "name": "TokenGuard",
-                "version": "0.1.0",
+                "version": "0.2.0",
                 "comment": "TokenGuard LLM Circuit Breaker & Telemetry Export",
             },
             "pages": [],

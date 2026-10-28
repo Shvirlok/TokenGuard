@@ -458,6 +458,7 @@ def test_cli_menu_and_simulate_parsers():
     assert parser.parse_args(["tui"]).command == "tui"
     assert parser.parse_args(["dashboard"]).command == "dashboard"
     assert parser.parse_args(["simulate", "--type", "loop"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "alternating_loop"]).command == "simulate"
 
 
 def test_cli_passive_flag(monkeypatch):
@@ -516,6 +517,125 @@ def test_cli_max_burn_rate_flag(monkeypatch):
     assert pid == 88888
     assert "--max-burn-rate" in spawned_cmds[0]
     assert "$0.50/min" in spawned_cmds[0]
+
+
+def test_cli_cmd_simulate_alternating_loop_local(monkeypatch, capsys):
+    """Verify cmd_simulate with alternating_loop runs local in-process simulation when daemon is offline."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "alternating_loop"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_alternating_loop_with_server(monkeypatch):
+    """Verify cmd_simulate with alternating_loop contacts server when daemon is running."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "alternating_loop"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
+
+    sim_payload = {
+        "simulation": "alternating_loop",
+        "tripped": True,
+        "cycle_length": 2,
+        "pattern": ["read_file", "bash"],
+        "results": [
+            {"attempt": 1, "tool": "read_file", "args": {"path": "server.py"}, "status": "allowed"},
+            {"attempt": 2, "tool": "bash", "args": {"command": "python server.py"}, "status": "allowed"},
+            {"attempt": 3, "tool": "read_file", "args": {"path": "server.py"}, "status": "allowed"},
+            {"attempt": 4, "tool": "bash", "args": {"command": "python server.py"}, "status": "blocked_tool_loop"},
+        ],
+        "details": {"message": "Tool ping-pong cycle detected: bash"},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = sim_payload
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, **kwargs):
+            return mock_resp
+
+    monkeypatch.setattr(httpx, "Client", MockClient)
+    cmd_simulate(args)
+
+
+def test_cli_env_command(capsys):
+    """Verify tokenguard env outputs export commands on stdout and eval instructions on stderr."""
+    from tokenguard.cli import cmd_env, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["env"])
+    assert args.command == "env"
+    assert args.unset is False
+
+    cmd_env(args)
+    captured = capsys.readouterr()
+    assert captured.out.strip() == 'export OPENAI_BASE_URL="http://localhost:8080/v1" ANTHROPIC_BASE_URL="http://localhost:8080"'
+    assert "eval $(tokenguard env)" in captured.err
+
+
+def test_cli_env_unset_command(capsys):
+    """Verify tokenguard env --unset outputs unset commands on stdout and eval instructions on stderr."""
+    from tokenguard.cli import cmd_env, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["env", "--unset"])
+    assert args.command == "env"
+    assert args.unset is True
+
+    cmd_env(args)
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "unset OPENAI_BASE_URL ANTHROPIC_BASE_URL"
+    assert "eval $(tokenguard env --unset)" in captured.err
+
+
+def test_cli_env_custom_host_port(capsys):
+    """Verify tokenguard env respects --host and --port arguments."""
+    from tokenguard.cli import cmd_env, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["env", "--host", "192.168.1.50", "--port", "9090"])
+
+    cmd_env(args)
+    captured = capsys.readouterr()
+    assert captured.out.strip() == 'export OPENAI_BASE_URL="http://192.168.1.50:9090/v1" ANTHROPIC_BASE_URL="http://192.168.1.50:9090"'
+
+
+def test_cli_dry_run_flags(monkeypatch):
+    """Verify --dry-run flag parsing on start and run subcommands, and daemon invocation."""
+    parser = create_parser()
+
+    # Test start with --dry-run
+    args_start = parser.parse_args(["start", "--dry-run"])
+    assert args_start.dry_run is True
+
+    # Test run with --dry-run
+    args_run = parser.parse_args(["run", "--dry-run", "python", "test_agent.py"])
+    assert args_run.dry_run is True
+
+    # Test start_daemon forwards --dry-run
+    spawned_cmds = []
+    def mock_popen(cmd, *args, **kwargs):
+        spawned_cmds.append(cmd)
+        proc = MagicMock()
+        proc.pid = 77777
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", mock_popen)
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    monkeypatch.setattr(cli_module, "wait_for_server", lambda h, p, timeout: True)
+
+    pid = start_daemon(port=8080, dry_run=True)
+    assert pid == 77777
+    assert "--dry-run" in spawned_cmds[0]
+
 
 
 

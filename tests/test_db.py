@@ -120,3 +120,91 @@ async def test_saved_cost_calculation_blocked_loops(tmp_path: Path):
     assert metrics["total_spent"] == 0.0
     assert metrics["saved_cost_estimate"] == 0.0159
 
+
+@pytest.mark.asyncio
+async def test_db_session_id_column_and_index(tmp_path: Path):
+    """Verify session_id TEXT column and idx_requests_session_id index in requests table."""
+    from tokenguard.db import get_all_requests_for_export
+
+    db_file = tmp_path / "test_session_id.db"
+    await init_db(db_file)
+
+    # 1. Verify schema columns
+    async with aiosqlite.connect(db_file) as db:
+        async with db.execute("PRAGMA table_info(requests);") as cursor:
+            cols = await cursor.fetchall()
+            col_names = [c[1] for c in cols]
+            assert "session_id" in col_names
+
+        async with db.execute("PRAGMA index_list(requests);") as cursor:
+            indices = await cursor.fetchall()
+            index_names = [idx[1] for idx in indices]
+            assert "idx_requests_session_id" in index_names
+
+        # 2. Verify index exists
+        async with db.execute("PRAGMA index_list(requests);") as cursor:
+            indices = await cursor.fetchall()
+            index_names = [idx[1] for idx in indices]
+            assert "idx_requests_session_id" in index_names
+
+    # 3. Log with and without session_id
+    id1 = await log_request(
+        db_path=db_file,
+        model="gpt-4o",
+        session_id="agent-run-123",
+        status="success",
+    )
+    id2 = await log_request(
+        db_path=db_file,
+        model="gpt-4o",
+        status="success",
+    )
+
+    recent = await get_recent_requests(db_path=db_file)
+    assert recent[0]["id"] == id2
+    assert recent[0]["session_id"] is None
+    assert recent[1]["id"] == id1
+    assert recent[1]["session_id"] == "agent-run-123"
+
+    all_exported = await get_all_requests_for_export(db_path=db_file)
+    assert all_exported[0]["session_id"] == "agent-run-123"
+    assert all_exported[1]["session_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_db_migration_adds_session_id(tmp_path: Path):
+    """Verify init_db gracefully alters an existing legacy requests table lacking session_id."""
+    db_file = tmp_path / "test_legacy.db"
+
+    # Create old table without session_id
+    async with aiosqlite.connect(db_file) as db:
+        await db.execute("""
+            CREATE TABLE requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_tokens INTEGER DEFAULT 0,
+                completion_tokens INTEGER DEFAULT 0,
+                cost_usd REAL DEFAULT 0.0,
+                latency_ms INTEGER DEFAULT 0,
+                prompt_hash TEXT,
+                status TEXT NOT NULL,
+                blocked_reason TEXT
+            );
+        """)
+        await db.commit()
+
+    # Run init_db which includes migration
+    await init_db(db_file)
+
+    async with aiosqlite.connect(db_file) as db:
+        async with db.execute("PRAGMA table_info(requests);") as cursor:
+            cols = await cursor.fetchall()
+            col_names = [c[1] for c in cols]
+            assert "session_id" in col_names
+
+        async with db.execute("PRAGMA index_list(requests);") as cursor:
+            indices = await cursor.fetchall()
+            index_names = [idx[1] for idx in indices]
+            assert "idx_requests_session_id" in index_names
+

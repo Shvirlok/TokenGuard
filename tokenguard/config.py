@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     passive: bool = Field(default=False, description="Passive observability mode")
     max_burn_rate: Optional[str] = Field(default=None, description="Sliding window burn rate limit (e.g. $0.50/min, $2.00/5m)")
     enable_context_ballooning: bool = Field(default=True, description="Enable runaway context ballooning guard")
+    dry_run: bool = Field(default=False, description="Observation mode (detect and log trips, but pass requests through upstream)")
 
     def model_post_init(self, __context) -> None:
         if self.max_repeats is not None:

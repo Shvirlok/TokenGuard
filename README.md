@@ -1,4 +1,4 @@
-# TokenGuard 🛡️
+# TokenGuard 
 
 ### Zero-trust local circuit breaker and real-time telemetry proxy for autonomous LLM agents
 
@@ -12,7 +12,7 @@
 
 ---
 
-## 📑 Table of contents
+##  Table of contents
 
 - [Overview](#-overview)
 - [System Architecture](#-system-architecture)
@@ -21,37 +21,43 @@
 - [Visual Showcase](#-visual-showcase)
 - [Screenshot Guide & Assets Checklist](#-screenshot-guide--assets-checklist)
 - [Core Features & Technical Deep Dive](#-core-features--technical-deep-dive)
-  - [1. Infinite Loop Circuit Breaker](#1-infinite-loop-circuit-breaker)
+  - [1. Infinite Loop & Tool Ping-Pong Circuit Breaker](#1-infinite-loop--tool-ping-pong-circuit-breaker)
   - [2. Velocity & Burn-Rate Circuit Breaker](#2-velocity--burn-rate-circuit-breaker)
   - [3. Context Ballooning Guard](#3-context-ballooning-guard)
-  - [4. True Zero-Latency Streaming (SSE Proxying)](#4-true-zero-latency-streaming-sse-proxying)
-  - [5. Budget Limiter & Avoided Cost Ledger](#5-budget-limiter--avoided-cost-ledger)
-  - [6. Dynamic Real-Time Pricing Synchronizer](#6-dynamic-real-time-pricing-synchronizer)
-  - [7. Multi-Format Telemetry Exporter](#7-multi-format-telemetry-exporter)
-  - [8. Zero-Friction Python SDK](#8-zero-friction-python-sdk)
-  - [9. High-End Developer CLI & Web Dashboard](#9-high-end-developer-cli--web-dashboard)
+  - [4. Observation Mode (`--dry-run` / Shadow Mode)](#4-observation-mode---dry-run--shadow-mode)
+  - [5. Saved Tokens & Cost Telemetry](#5-saved-tokens--cost-telemetry)
+  - [6. True Zero-Latency Streaming (SSE Proxying)](#6-true-zero-latency-streaming-sse-proxying)
+  - [7. Budget Limiter & Avoided Cost Ledger](#7-budget-limiter--avoided-cost-ledger)
+  - [8. Dynamic Real-Time Pricing Synchronizer](#8-dynamic-real-time-pricing-synchronizer)
+  - [9. Multi-Format Telemetry Exporter](#9-multi-format-telemetry-exporter)
+  - [10. Zero-Friction Python SDK](#10-zero-friction-python-sdk)
+  - [11. High-End Developer CLI & Web Dashboard](#11-high-end-developer-cli--web-dashboard)
 - [Installation & Quickstart](#-installation--quickstart)
 - [Complete CLI Command Reference](#-complete-cli-command-reference)
   - [1. `tokenguard start`](#1-tokenguard-start)
   - [2. `tokenguard stop`](#2-tokenguard-stop)
   - [3. `tokenguard status`](#3-tokenguard-status)
   - [4. `tokenguard run`](#4-tokenguard-run)
-  - [5. `tokenguard export`](#5-tokenguard-export)
-  - [6. `tokenguard prices`](#6-tokenguard-prices)
-  - [7. `tokenguard quickstart`](#7-tokenguard-quickstart)
+  - [5. `tokenguard env` (Terminal Environment Injector)](#5-tokenguard-env-terminal-environment-injector)
+  - [6. `tokenguard simulate` (Loop & Tool Cycle Simulator)](#6-tokenguard-simulate-loop--tool-cycle-simulator)
+  - [7. `tokenguard export`](#7-tokenguard-export)
+  - [8. `tokenguard prices`](#8-tokenguard-prices)
+  - [9. Reactive CLI Control (`kill`, `resume`, `profile`, `clear`, `logs`)](#9-reactive-cli-control-kill-resume-profile-clear-logs)
+  - [10. `tokenguard quickstart`](#10-tokenguard-quickstart)
   - [Interactive TUI Navigation](#interactive-tui-navigation)
 - [Python SDK Guide & Code Recipes](#-python-sdk-guide--code-recipes)
   - [Function Decorator (`@protect`)](#function-decorator-protect)
   - [Context Manager (`with guard():`)](#context-manager-with-guard)
   - [Framework Integrations (LangChain, CrewAI, AutoGen, OpenAI)](#framework-integrations)
 - [REST API Reference](#-rest-api-reference)
+  - [Circuit Breaker 429 Error Format & Custom Headers](#circuit-breaker-429-error-format--custom-headers)
 - [Model Pricing Matrix](#-model-pricing-matrix)
 - [Automated Testing & CI](#-automated-testing--ci)
 - [Contributing & License](#-contributing--license)
 
 ---
 
-## 📋 Overview
+## Overview
 
 Autonomous LLM agents (e.g. AutoGPT, CrewAI, LangGraph, Cursor background tasks, reasoning loops) frequently get trapped in **recursive prompt loops**, repeating identical tool calls or queries hundreds of times in seconds. Without guardrails, this can consume hundreds or thousands of dollars in API credits within minutes.
 
@@ -70,6 +76,7 @@ Autonomous LLM agents (e.g. AutoGPT, CrewAI, LangGraph, Cursor background tasks,
                   │                                                         │
                   │  ● SHA-256 Prompt Hashing      ● Real-Time Budget Cap   │
                   │  ● Sliding Window Loop Check   ● Avoided Cost Ledger    │
+                  │  ● Tool Ping-Pong Detection    ● Observation Shadow Mode│
                   │  ● Live OpenRouter Pricing     ● SQLite WAL Telemetry   │
                   └────────────┬───────────────────────────────┬────────────┘
                                │                               │
@@ -85,16 +92,20 @@ Autonomous LLM agents (e.g. AutoGPT, CrewAI, LangGraph, Cursor background tasks,
 
 ### Why TokenGuard?
 
-- **Zero-latency in-Memory guardrails**: Sub-millisecond pre-flight checks using sliding-window prompt hashing and sliding expenditure counters.
+- **Zero-latency in-memory guardrails**: Sub-millisecond pre-flight checks using sliding-window prompt hashing and sliding expenditure counters.
+- **Multi-step tool cycle detection**: Detects identical tool loops ($A \to A \to A$), alternating tool ping-pong cycles ($A \to B \to A \to B$), and 3-step loops ($A \to B \to C \to A \to B \to C$) while automatically stripping dynamic nonces and UUIDs.
+- **Observation shadow mode (`--dry-run`)**: Safely test circuit breaker trip rules against live production agent traffic without cutting connections.
+- **Saved tokens & USD cost telemetry**: Automated calculation of intercepted token & USD savings delivered directly via custom HTTP response headers (`X-TokenGuard-*`) and JSON bodies.
+- **Terminal environment injector (`tokenguard env`)**: Instantly route OpenAI, Anthropic, Gemini, and DeepSeek SDKs through TokenGuard with `eval $(tokenguard env)`.
 - **Drop-in compatibility**: Universal OpenAI-compatible `/v1/chat/completions` endpoint, native Anthropic `/v1/messages` endpoint, and Claude OpenAI adapter.
 - **Never breaks future prompts**: Loop rejections never poison future requests; sending a distinct prompt immediately succeeds without false positives.
 - **Live dynamic pricing**: Syncs token rates directly with OpenRouter's live registry with offline caching and instant failover.
-- **Enterprise-grade telemetry**: Query telemetry in non-blocking SQLite WAL mode and export to **HAR 1.2** (Chrome DevTools / Postman compatible with custom `_tokenCost` annotations), **JSONL**, **JSON**, and **CSV**.
+- **Enterprise-grade telemetry**: Query telemetry in non-blocking SQLite WAL mode with indexed `session_id` and export to **HAR 1.2** (Chrome DevTools / Postman compatible with custom `_tokenCost` annotations), **JSONL**, **JSON**, and **CSV**.
 - **Dual developer experience**: Includes a sleek dark-mode Web Dashboard with live Server-Sent Events (SSE) and a minimal, keyboard-driven Stripe-styled Terminal TUI.
 
 ---
 
-## 🏗️ System architecture
+## System architecture
 
 ### High-level architecture diagram
 
@@ -218,38 +229,41 @@ sequenceDiagram
 
 ---
 
-## 📸 Visual showcase
+## Visual showcase
 
 | Screenshot | Description & visual capabilities |
 | :--- | :--- |
-| ![Dashboard Overview](assets/images/1_dashboard_overview.png) | **Real-time control center**: Live metrics, active profile, hourly spend against budget limits, avoided savings tracker, and status indicators. |
-| ![Live Request Table](assets/images/2_live_metrics_table.png) | **Audit and telemetry ledger**: Complete request log with per-call tokens, exact model pricing, latency in ms, prompt hash, and blocked reasons. |
-| ![Developer Terminal TUI](assets/images/3_cli_control_center.png) | **Developer CLI interface**: Stripe/GitHub CLI aesthetic featuring arrow navigation, zero emoji clutter, and fixed-column alignment. |
-| ![Telemetry Export](assets/images/4_telemetry_export.png) | **Enterprise telemetry export**: HAR 1.2 (Postman/Chrome DevTools compatible with `_tokenCost`), JSONL, JSON, and CSV downloads. |
+| ![Dashboard Overview](assets/images/tokenguard-loop-detection.png) | Automatic detection and termination of alternating tool loops (A→B→A→B) before calls reach upstream LLM providers, reporting avoided cost in real time. |
+| ![Live Request Table](assets/images/tokenguard-web-dashboard.png) | Live request inspection, kill-switch control, budget tracking, and direct configuration snippets for Python, TypeScript, and shell environments. |
+| ![Developer Terminal TUI](assets/images/tokenguard-cli-profiles.png) | Instant provider key detection across OpenAI, Anthropic, Gemini and DeepSeek, with pre-configured loop cutoff and spending profiles (Careful, Standard, Passive). |
+| ![Telemetry Export](assets/images/tokenguard-control-center.png) |  Manage proxy daemons, execute guarded scripts via tokenguard run, and toggle emergency traffic cutoff directly from the terminal. |
 
 ---
 
-## 🖼️ Screenshot guide & assets checklist
+## Screenshot guide & assets checklist
 
 All screenshots are stored in the [`assets/images/`](assets/images/) directory. If you are updating, taking new screenshots, or contributing visuals, follow this checklist:
 
-| Asset File | Target View to Capture | Recommended Setup & Data State |
+| Asset file | Target view to capture | Recommended setup and data state |
 | :--- | :--- | :--- |
-| [`01_dashboard_overview.png`](assets/images/01_dashboard_overview.png) | Full web dashboard landing page at `http://127.0.0.1:8080`. | Capture with dark mode enabled, after generating at least 5-10 requests so metric cards show non-zero spend and savings. |
-| [`02_live_metrics_table.png`](assets/images/02_live_metrics_table.png) | Request log table focused on the status badges (`SUCCESS`, `BLOCKED LOOP`, `BLOCKED BUDGET`). | Show a mix of successful completions and blocked loop intercepts with token counts and latency numbers. |
-| [`03_stream_and_charts.png`](assets/images/03_stream_and_charts.png) | Right sidebar showing the live SSE event ticker and the hourly spending graph. | Trigger a few requests in real time to capture live pulsing event dots and chart bars. |
-| [`04_simulation_suite.png`](assets/images/04_simulation_suite.png) | "Simulate" modal dialog after running a 3-step loop detection test. | Show the modal showing Attempt #1 (allowed), Attempt #2 (allowed), Attempt #3 (blocked with 429). |
-| [`05_cli_control_center.png`](assets/images/05_cli_control_center.png) | Interactive CLI TUI launched via `tokenguard` (no arguments). | Capture terminal window (80+ columns) showing the menu, selected arrow pointer `›`, and active status panel. |
-| [`06_telemetry_export.png`](assets/images/06_telemetry_export.png) | Postman or Chrome DevTools Network panel importing `tokenguard_export.har`. | Show custom `_tokenCost` and `_blockedReason` fields visible inside the HAR inspector. |
+| [`tokenguard-loop-detection.png`](assets/images/tokenguard-loop-detection.png) | Automatic detection and termination of alternating tool loops (A→B→A→B) before calls reach upstream LLM providers, reporting avoided cost in real time. | Run `tokenguard simulate --type alternating_loop` in an empty terminal window. Ensure table rows (steps 1–4), blocked 429 status, cycle length indicator, and avoided spend are fully visible with no prompt trailing below. |
+| [`tokenguard-web-dashboard.png`](assets/images/tokenguard-web-dashboard.png) | Live request inspection, kill-switch control, budget tracking and direct configuration snippets for Python, TypeScript and shell environments. | Open dashboard at `http://127.0.0.1:8080`. Trigger at least 3 requests (2 allowed, 1 tripped loop) so traffic stream shows `[TOOL RETRY LOOP: HARD STOP]`, preserved budget ($0.01+), and code snippets tab active. |
+| [`tokenguard-cli-profiles.png`](assets/images/tokenguard-cli-profiles.png) | Instant provider key detection across OpenAI, Anthropic, Gemini and DeepSeek, with pre-configured loop cutoff and spending profiles (Careful, Standard, Passive). | Launch `tokenguard init` or interactive setup with at least one active API key exported (`OPENAI_API_KEY`). Ensure profile selector highlights the `Careful` tier with loop cutoff details shown. |
+| [`tokenguard-control-center.png`](assets/images/tokenguard-control-center.png) | Manage proxy daemons, execute guarded scripts via tokenguard run, and toggle emergency traffic cutoff directly from the terminal. | Start proxy daemon (`tokenguard start`). Run interactive CLI menu showing `ACTIVE & GUARDING` status, local endpoints, `Careful` profile, and numbered arrow-navigable action list. |
 
 ---
 
 ## ⚡ Core features & technical deep dive
 
-### 1. Infinite loop circuit breaker
-- **Deterministic hashing**: Computes SHA-256 hashes of normalized message arrays.
-- **Sliding-window matching**: Compares the incoming prompt against the last $N$ requests inside a rolling time window (default: 60s).
+### 1. Infinite loop & tool ping-pong circuit breaker
+- **Deterministic hashing**: Computes SHA-256 hashes of normalized message arrays for sub-millisecond loop matching.
+- **Sliding-window matching**: Compares incoming prompts against previous requests inside a rolling time window (default: 60s).
 - **Non-poisoning architecture**: When an identical prompt is blocked with `429 Too Many Requests`, the rejection is **not** appended to the rolling window. As a result, when the agent fixes its state and sends a distinct prompt, it succeeds immediately.
+- **Multi-step tool cycle detection**:
+  - **Length 1 cycle ($A \to A \to A$)**: Intercepts identical tool call retries.
+  - **Length 2 cycle ($A \to B \to A \to B$)**: Intercepts oscillating tool loops (e.g. `read_file` $\leftrightarrow$ `bash` execution cycles).
+  - **Length 3 cycle ($A \to B \to C \to A \to B \to C$)**: Intercepts recurring three-step exploratory agent cycles.
+- **Dynamic nonce & volatile ID stripping**: Automatically strips dynamic fields (`call_id`, `timestamp`, `ts`, `nonce`, `_id`, `request_id`) in `normalize_tool_arguments()` before running similarity analysis. Prevents agent framework runtime IDs or timestamps from masking repeated tool calls.
 
 ### 2. Velocity & burn-rate circuit breaker
 - **Sliding window burn rate**: Beyond static prompt hashing, autonomous agents can burn budget across non-identical retry loops. TokenGuard tracks spending velocity with `--max-burn-rate` (e.g. `$0.50/min`, `$2.00/5m`, or `1.50/30s`).
@@ -258,36 +272,50 @@ All screenshots are stored in the [`assets/images/`](assets/images/) directory. 
 
 ### 3. Context ballooning guard
 - **Runaway context detection**: Autonomous agents trapped in retry loops monotonically expand their context as compiler errors and debug logs accumulate.
-- **Monotonic growth evaluation**: Tracks session sequence (`x-session-id`). If `prompt_tokens` increases by > 300% across 3 consecutive requests without an explicit task update or cache hit, it is blocked immediately as abnormal runaway context expansion.
+- **Monotonic growth evaluation**: Tracks session sequence (`session_id`). If `prompt_tokens` increases by > 300% across 3 consecutive requests without an explicit task update or cache hit, it is blocked immediately as abnormal runaway context expansion.
 - **Bypass markers**: Automatically allows large context growth when accompanied by a task milestone (e.g. `x-task-status`, metadata commit status) or prompt caching hits (`x-cache-hit`).
 
-### 4. True zero-latency streaming (SSE proxying)
+### 4. Observation mode (`--dry-run` / shadow mode)
+- **Zero-disruption production auditing**: Run TokenGuard with `--dry-run` to monitor trip conditions without severing LLM agent connections or breaking production workflows.
+- **Pass-through execution**: When a circuit breaker trips in observation mode, TokenGuard logs terminal warning alerts, records the `blocked_reason` in the SQLite database, and transparently passes the request upstream (`200 OK`).
+- **Audit response headers**: Injects `X-TokenGuard-Dry-Run: true` and `X-TokenGuard-Status: tripped` along with the reason and saved telemetry headers into upstream HTTP responses.
+
+### 5. Saved tokens & cost telemetry
+- **Real-time savings calculation**: On every tripped circuit breaker, TokenGuard calculates the exact prompt tokens and estimated avoided completion tokens (derived from session average history or fallback 500 completion tokens) multiplied by live model rates.
+- **Custom HTTP telemetry headers**:
+  - `X-TokenGuard-Status: tripped`
+  - `X-TokenGuard-Reason: <reason>`
+  - `X-TokenGuard-Tokens-Saved: <count>`
+  - `X-TokenGuard-USD-Saved: <cost>`
+- **Machine-readable JSON body**: Both the root object and nested `error` dictionary include `tokens_saved` and `usd_saved`.
+
+### 6. True zero-latency streaming (SSE proxying)
 - **Pass-through asynchronous streaming**: When `stream: true` is requested, chunks are yielded downstream immediately (< 5ms latency overhead) via `httpx.AsyncClient` and `fastapi.responses.StreamingResponse`. Never buffers responses in memory.
 - **Non-blocking background accounting (`StreamAccumulator`)**: Concurrently parses native provider usage frames (e.g. OpenAI `stream_options={"include_usage": true}` or Anthropic usage blocks) without introducing backpressure to the generator loop.
 - **Omitted usage fallback**: If upstream omits token usage, maintains a lightweight character accumulator to estimate tokens accurately.
 - **Robust connection lifecycle**: Gracefully handles client disconnects and `asyncio.CancelledError`, immediately closing upstream sockets to prevent socket leaks.
 
-### 5. Budget limiter and avoided cost ledger
+### 7. Budget limiter and avoided cost ledger
 - **Dual sliding windows**: Monitors both sliding 1-hour and 24-hour spending totals against configurable caps (e.g. `--limit 5.0` for \$5/hr).
-- **Avoided cost calculation**: When a request is blocked, TokenGuard calculates how much money was saved based on the model's token rate, prompt size, and an estimated 500 completion tokens.
+- **Avoided cost calculation**: When a request is blocked, TokenGuard calculates how much money was saved based on the model's token rate, prompt size, and estimated completion tokens.
 - **Audio and desktop notifications**: Fires a non-blocking background notification (macOS AppleScript / Linux `notify-send`) and audible terminal bell when a runaway loop is intercepted.
 
-### 6. Dynamic real-time pricing synchronizer
+### 8. Dynamic real-time pricing synchronizer
 - **OpenRouter Live Registry**: Automatically fetches the latest pricing tables for over 400 models from `openrouter.ai/api/v1/models` without requiring an API key.
 - **Local TTL caching**: Saves cached rates to `~/.tokenguard/prices_cache.json` with a 24-hour TTL.
 - **Offline-first fallback**: If internet connectivity is down, it instantly falls back to the embedded [`tokenguard/prices.json`](tokenguard/prices.json) baseline.
 
-### 7. Multi-format telemetry exporter
+### 9. Multi-format telemetry exporter
 - **HAR 1.2 standard**: Exports valid HTTP Archive 1.2 files compatible with Chrome DevTools, Postman, and Charles Proxy, enriched with custom `_tokenCost`, `_promptTokens`, `_completionTokens`, and `_blockedReason` fields.
 - **JSONL and CSV**: Fast newline-delimited JSON and standard CSV streams for downstream data pipelines, Pandas, and SIEM logging.
 - **Non-blocking WAL queries**: Reads from SQLite with `PRAGMA query_only = ON;` and `PRAGMA synchronous = NORMAL;`, ensuring zero lock contention with active proxy writers.
 
-### 8. Zero-friction Python SDK
+### 10. Zero-friction Python SDK
 - **Function decorator (`@tokenguard.protect`)**: Protects synchronous or asynchronous functions with automatic proxy routing.
 - **Context manager (`with tokenguard.guard():`)**: Sets environment variables (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `DEEPSEEK_BASE_URL`, etc.) within the scope and safely restores them on exit or exceptions.
 - **Daemon auto-start**: Automatically starts the TokenGuard background daemon if it is not currently running.
 
-### 9. High-end developer CLI & web dashboard
+### 11. High-end developer CLI & web dashboard
 - **CLI TUI**: Built with Rich, featuring clean ASCII glyphs (`›`, `·`, `●`), zero-emoji clutter, and rock-solid column alignment that never wraps on 80-column terminals.
 - **Next.js web dashboard**: Dark-mode interface with live SSE updates, distribution charts, quickstart simulations, and interactive configuration controls.
 
@@ -336,14 +364,33 @@ tokenguard
 open http://127.0.0.1:8080
 ```
 
+### 4. Route your existing applications & terminal
+You can route any terminal session to TokenGuard in a single command without modifying source code:
+
+```bash
+# Export proxy variables for OpenAI, Anthropic, Gemini, DeepSeek
+eval $(tokenguard env)
+
+# Run any agent script transparently through TokenGuard
+python my_agent.py
+
+# When finished, restore direct upstream connections
+eval $(tokenguard env --unset)
+```
+
+Or execute commands directly through the subprocess wrapper:
+```bash
+tokenguard run -- python my_agent.py
+```
+
 ---
 
 ## 💻 Complete CLI command reference
 
-TokenGuard provides a full suite of CLI commands for server management, script wrapping, telemetry export, and live pricing updates.
+TokenGuard provides a full suite of CLI commands for server management, script wrapping, telemetry export, live pricing updates, and interactive terminal control.
 
 ```
-usage: tokenguard [-h] {start,stop,status,run,export,prices,quickstart} ...
+usage: tokenguard [-h] {start,stop,status,run,env,simulate,export,prices,kill,resume,profile,clear,logs,quickstart} ...
 ```
 
 ---
@@ -367,11 +414,15 @@ tokenguard start [options]
 | `--loop-window` | `float` | `60.0` | Sliding time window in seconds for consecutive loop matching. |
 | `--profile` | `str` | `careful` | Preset profile: `careful` (\$5/hr, 2 loops), `standard` (\$15/hr, 4 loops), `passive`. |
 | `--passive` | Flag | `False` | Run in passive observability mode (no loop or budget cutoffs). |
+| `--dry-run` | Flag | `False` | Run in observation mode (detect and log trips, but pass requests through upstream without 429 cutoffs). |
 
 **Examples:**
 ```bash
 # Start in background with strict $2/hr limit and $0.50/min burn rate velocity
 tokenguard start -d --limit 2.0 --max-burn-rate '$0.50/min'
+
+# Start in observation shadow mode to audit trips without blocking requests
+tokenguard start -d --dry-run
 
 # Start in passive monitoring mode on custom port
 tokenguard start -d --port 9090 --passive
@@ -429,11 +480,15 @@ tokenguard run [options] -- <command> [args...]
 | `--max-burn-rate` | `str` | `None` | Burn rate velocity limit for this run (e.g. `$0.50/min`). |
 | `--max-repeats` | `int` | `3` | Maximum loop repeats before blocking. |
 | `--passive` | Flag | `False` | Run in non-blocking observability mode. |
+| `--dry-run` | Flag | `False` | Run in observation mode (detect and log trips, but pass requests through upstream). |
 
 **Examples:**
 ```bash
 # Protect a Python agent script with burn rate and hourly limit
 tokenguard run --max-burn-rate '$0.50/min' --limit 5.0 -- python agent.py
+
+# Run in observation mode to test circuit breaker thresholds against a live run
+tokenguard run --dry-run -- python agent.py
 
 # Run an npm/Node.js autonomous agent
 tokenguard run -- npm start
@@ -444,7 +499,66 @@ tokenguard run --max-repeats 2 -- pytest tests/
 
 ---
 
-### 5. `tokenguard export`
+### 5. `tokenguard env` (Terminal Environment Injector)
+Print shell environment export or unset commands to route LLM SDKs through TokenGuard.
+
+```bash
+tokenguard env [options]
+```
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--unset` | Flag | `False` | Print shell commands to unset TokenGuard environment variables. |
+| `--host` | `str` | `localhost` | Proxy host address. |
+| `--port` | `int` | `8080` | Proxy port. |
+
+**Examples:**
+```bash
+# Route current terminal session through TokenGuard:
+eval $(tokenguard env)
+
+# Check active proxy URL in environment:
+echo $OPENAI_BASE_URL
+# Output: http://localhost:8080/v1
+
+# Restore direct upstream connections:
+eval $(tokenguard env --unset)
+
+# Specify custom host/port:
+eval $(tokenguard env --host 192.168.1.10 --port 9090)
+```
+
+---
+
+### 6. `tokenguard simulate` (Loop & Tool Cycle Simulator)
+Run instant circuit breaker simulation to verify loop or budget protection locally or through the proxy.
+
+```bash
+tokenguard simulate [options]
+```
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--type` | `choice` | `loop` | Simulation type: `loop`, `tool_loop`, `alternating_loop`, `budget`, `success`. |
+| `--model` | `str` | `gpt-4o` | Model name for simulation. |
+| `--host` | `str` | `127.0.0.1` | Proxy host address. |
+| `--port` | `int` | `8080` | Proxy port. |
+
+**Examples:**
+```bash
+# Simulate alternating tool ping-pong cycle (read_file <-> bash):
+tokenguard simulate --type alternating_loop
+
+# Simulate single repeated tool retry loop:
+tokenguard simulate --type tool_loop
+
+# Simulate prompt repeat loop:
+tokenguard simulate --type loop
+```
+
+---
+
+### 7. `tokenguard export`
 Export recorded request telemetry directly from SQLite in WAL mode without blocking incoming proxy writes.
 
 ```bash
@@ -471,7 +585,7 @@ tokenguard export --format csv --output telemetry.csv
 
 ---
 
-### 6. `tokenguard prices`
+### 8. `tokenguard prices`
 Manage model pricing registries, sync live rates from OpenRouter, and view active token costs.
 
 ```bash
@@ -495,7 +609,31 @@ tokenguard prices --offline
 
 ---
 
-### 7. `tokenguard quickstart`
+### 9. Reactive CLI control (`kill`, `resume`, `profile`, `clear`, `logs`)
+Quickly inspect or control running TokenGuard daemons directly from the terminal without opening a browser:
+
+```bash
+# Engage emergency kill switch immediately (blocks all LLM traffic with HTTP 429)
+tokenguard kill
+
+# Disengage kill switch and resume normal traffic
+tokenguard resume
+
+# Switch active guard profile on the fly
+tokenguard profile careful   # $5/hr limit, threshold 2
+tokenguard profile standard  # $15/hr limit, threshold 4
+tokenguard profile passive   # Observability only (no cutoffs)
+
+# Wipe request logs and reset in-memory counters
+tokenguard clear
+
+# Stream live LLM request logs in terminal
+tokenguard logs -f
+```
+
+---
+
+### 10. `tokenguard quickstart`
 Interactive setup wizard to detect API keys, configure guard profiles, and launch the proxy.
 
 ```bash
@@ -643,28 +781,52 @@ TokenGuard exposes standard proxy routes alongside management and streaming endp
 | `POST` | `/api/simulate` | Trigger simulated loop or success events for onboarding validation. |
 | `POST` | `/api/clear-logs` | Wipe SQLite request logs and reset in-memory counters. |
 
-### Circuit breaker 429 error format
+### Circuit breaker 429 error format & custom headers
 
-When TokenGuard trips due to a burn-rate breach, context ballooning, budget limit, or prompt loop, it immediately cuts off upstream calls and returns an explicit, machine-readable HTTP 429 response:
+When TokenGuard trips due to a burn-rate breach, context ballooning, budget limit, tool ping-pong cycle, or prompt loop, it cuts off upstream calls and returns an explicit, machine-readable HTTP 429 response accompanied by custom telemetry headers:
 
+#### Response Headers:
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+X-TokenGuard-Status: tripped
+X-TokenGuard-Reason: TokenGuard: infinite agent loop detected (3 identical consecutive requests)
+X-TokenGuard-Tokens-Saved: 650
+X-TokenGuard-USD-Saved: 0.0065
+```
+
+#### Response Body:
 ```json
 {
   "error": {
-    "message": "TokenGuard Circuit Breaker Tripped: Burn rate exceeded ($0.58 in 42s). Hard limit: $0.50/min.",
-    "type": "tokenguard_budget_breach",
-    "code": "burn_rate_exceeded",
-    "current_spend": 0.58,
-    "budget_limit": 0.50
-  }
+    "message": "TokenGuard: infinite agent loop detected (3 identical consecutive requests)",
+    "type": "loop_detected",
+    "tokens_saved": 650,
+    "usd_saved": 0.0065
+  },
+  "tokens_saved": 650,
+  "usd_saved": 0.0065
 }
 ```
 
-*Common circuit breaker codes:*
+#### Observation Mode (`--dry-run`) Headers:
+When running in observation mode, the connection is **not** cut with 429; instead, the request is passed through upstream with `200 OK`, and shadow trip telemetry headers are attached:
+```http
+HTTP/1.1 200 OK
+X-TokenGuard-Dry-Run: true
+X-TokenGuard-Status: tripped
+X-TokenGuard-Reason: TokenGuard intercepted alternating tool call loop (Length 2: read_file -> bash)
+X-TokenGuard-Tokens-Saved: 850
+X-TokenGuard-USD-Saved: 0.0085
+```
+
+#### Common Circuit Breaker Codes:
+- `TOOL_PING_PONG_LOOP`: Intercepted alternating ($A \to B \to A \to B$), cyclical, or identical tool call loops.
 - `burn_rate_exceeded`: Sliding window spending velocity limit breached.
 - `context_ballooning_detected`: Prompt tokens expanded > 300% across 3 consecutive requests in session.
 - `budget_exceeded`: Sliding hourly or daily expenditure limit exceeded.
 - `loop_detected`: Identical prompt repeated consecutively.
-- `kill_switch_active`: Emergency kill switch active. |
+- `kill_switch_active`: Emergency kill switch active.
 
 ---
 
@@ -697,17 +859,36 @@ TokenGuard maintains a built-in pricing registry (USD per 1,000,000 tokens) upda
 
 ## Automated testing and CI
 
-TokenGuard is covered by a test suite executed against multi-OS environments on GitHub Actions.
+TokenGuard is thoroughly validated by an automated test suite of **106 tests** executed against multi-OS environments on GitHub Actions.
 
 ```bash
-# Run complete test suite with verbose output
+# Run complete test suite with verbose output (106 tests)
 pytest -v
 
 # Run tests with short summary
 pytest -q
 
 # Run specific test suites
-pytest tests/test_guard.py tests/test_sdk.py tests/test_export.py
+pytest tests/test_guard.py tests/test_proxy.py tests/test_cli.py tests/test_db.py
+```
+
+### Test Coverage Highlights
+- **Circuit Breaker Integrity**: Prompt loop detection, tool ping-pong cycle detection ($A \to B \to A \to B$), dynamic nonce stripping, burn-rate limits, and context ballooning guards.
+- **Observation Mode**: Verified pass-through behavior, shadow header attachment, and SQLite blocked-reason audit logging.
+- **Saved Telemetry**: Validated token count and USD pricing calculations injected into 429 response headers and JSON bodies.
+- **Database & WAL Mode**: Non-destructive migrations (`ALTER TABLE requests ADD COLUMN session_id TEXT`), indexing (`idx_requests_session_id`), and concurrent WAL reader/writer isolation.
+- **Multi-Provider Proxies**: OpenAI chat completions, native Anthropic messages, Anthropic-to-OpenAI adapters, and DeepSeek endpoints.
+- **CLI & SDK**: Environment injector (`tokenguard env`), interactive TUI navigation, daemon lifecycle management, and `@protect` / `with guard():` decorators.
+
+```bash
+# Run complete test suite (106 tests passing)
+pytest -v
+
+# Run tests with short summary
+pytest -q
+
+# Run specific test suites
+pytest tests/test_guard.py tests/test_proxy.py tests/test_cli.py tests/test_db.py
 ```
 
 ### GitHub Actions Workflow Matrix

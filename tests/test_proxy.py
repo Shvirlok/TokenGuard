@@ -527,7 +527,21 @@ async def test_simulate_and_clear_logs_endpoints(test_app):
         assert sim_succ.status_code == 200
         assert sim_succ.json()["simulation"] == "success"
 
-        # 3. Clear Logs
+        # 3. Simulate Alternating Loop (A-B-A-B)
+        sim_alt = client.post("/api/simulate", json={"type": "alternating_loop", "model": "gpt-4o"})
+        assert sim_alt.status_code == 200
+        alt_data = sim_alt.json()
+        assert alt_data["simulation"] == "alternating_loop"
+        assert alt_data["tripped"] is True
+        assert alt_data["cycle_length"] == 2
+        assert alt_data["pattern"] == ["read_file", "bash"]
+        assert len(alt_data["results"]) == 4
+        assert alt_data["results"][0]["status"] == "allowed"
+        assert alt_data["results"][1]["status"] == "allowed"
+        assert alt_data["results"][2]["status"] == "allowed"
+        assert alt_data["results"][3]["status"] == "blocked_tool_loop"
+
+        # 4. Clear Logs
         clear_resp = client.post("/api/clear-logs")
         assert clear_resp.status_code == 200
         assert clear_resp.json()["status"] == "cleared"
@@ -795,6 +809,38 @@ def test_tool_ping_pong_proxy_intercept(test_app):
         assert "TokenGuard intercepted repeated tool call loop: read_file" in data["error"]["message"]
 
 
+def test_alternating_tool_loop_proxy_intercept(test_app):
+    """Verify that oscillating alternating tool calls (A-B-A-B) trip the circuit breaker and return 429."""
+    with TestClient(test_app) as client:
+        guard = proxy_module.get_guard()
+        guard.reset()
+        guard.tool_loop_threshold = 3
+
+        headers = {"x-agent-id": "agent-oscillating-worker"}
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "Execute alternating tools"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "data.csv"}'}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "Error: Permission denied"},
+                {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "bash", "arguments": '{"command": "chmod 777 data.csv"}'}}]},
+                {"role": "tool", "tool_call_id": "c2", "content": "Operation not permitted"},
+                {"role": "assistant", "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "data.csv"}'}}]},
+                {"role": "tool", "tool_call_id": "c3", "content": "Error: Permission denied"},
+                {"role": "assistant", "tool_calls": [{"id": "c4", "type": "function", "function": {"name": "bash", "arguments": '{"command": "chmod 777 data.csv"}'}}]},
+            ],
+        }
+
+        resp = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert resp.status_code == 429
+        data = resp.json()
+        assert "error" in data
+        assert data["error"]["type"] == "circuit_breaker"
+        assert data["error"]["code"] == "TOOL_PING_PONG_LOOP"
+        assert data["error"]["cycle_length"] == 2
+        assert data["error"]["pattern"] == ["read_file", "bash"]
+
+
 @pytest.mark.asyncio
 async def test_api_events_sse_endpoint(test_app):
     """Verify that GET /api/events establishes SSE text/event-stream StreamingResponse."""
@@ -834,6 +880,177 @@ def test_simulate_tool_loop_endpoint(test_app):
         tool_loop_reqs = [r for r in reqs if r["status"] == "blocked_tool_loop"]
         assert len(tool_loop_reqs) >= 1
         assert "[TOOL RETRY LOOP: HARD STOP]" in tool_loop_reqs[0]["blocked_reason"]
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_saved_telemetry_headers_and_body(test_app, monkeypatch):
+    """Verify X-TokenGuard-Status, Reason, Tokens-Saved, USD-Saved headers and JSON body telemetry on 429."""
+    with TestClient(test_app) as client:
+        mock_openai_response = {
+            "id": "chatcmpl-telemetry",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 150, "completion_tokens": 50, "total_tokens": 200},
+        }
+
+        async def mock_post(url, json=None, headers=None):
+            return httpx.Response(status_code=200, json=mock_openai_response, headers={"Content-Type": "application/json"})
+
+        monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
+
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Telemetry test prompt runaway loop"}],
+        }
+
+        # 1st request -> allowed
+        r1 = client.post("/v1/chat/completions", json=payload)
+        assert r1.status_code == 200
+
+        # 2nd request -> allowed
+        r2 = client.post("/v1/chat/completions", json=payload)
+        assert r2.status_code == 200
+
+        # 3rd request -> tripped (loop_threshold = 3)
+        r3 = client.post("/v1/chat/completions", json=payload)
+        assert r3.status_code == 429
+
+        # Headers check
+        assert r3.headers.get("x-tokenguard-status") == "tripped"
+        assert "infinite agent loop detected" in r3.headers.get("x-tokenguard-reason", "")
+        tokens_saved_header = r3.headers.get("x-tokenguard-tokens-saved")
+        assert tokens_saved_header is not None
+        assert int(tokens_saved_header) > 0
+        usd_saved_header = r3.headers.get("x-tokenguard-usd-saved")
+        assert usd_saved_header is not None
+        assert float(usd_saved_header) > 0.0
+
+        # JSON body check
+        body = r3.json()
+        assert body["tokens_saved"] == int(tokens_saved_header)
+        assert pytest.approx(body["usd_saved"], 1e-4) == float(usd_saved_header)
+        assert body["error"]["tokens_saved"] == int(tokens_saved_header)
+        assert pytest.approx(body["error"]["usd_saved"], 1e-4) == float(usd_saved_header)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_observation_mode_chat_completions(tmp_path: Path, monkeypatch):
+    """Verify that in dry_run mode, requests that trip circuit breaker pass through upstream with 200 OK and headers."""
+    db_file = tmp_path / "test_dryrun.db"
+    dry_settings = Settings(
+        host="127.0.0.1",
+        port=8080,
+        loop_threshold=2,
+        db_path=db_file,
+        dry_run=True,
+    )
+    set_settings(dry_settings)
+    app = create_app(dry_settings)
+
+    with TestClient(app) as client:
+        mock_response = {
+            "id": "chatcmpl-dryrun",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Upstream response in shadow mode"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+        }
+
+        async def mock_post(url, json=None, headers=None):
+            return httpx.Response(status_code=200, json=mock_response, headers={"Content-Type": "application/json"})
+
+        monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
+
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Same prompt to trigger trip in dry-run"}],
+        }
+
+        # Request 1 -> 200 OK (Allowed)
+        r1 = client.post("/v1/chat/completions", json=payload)
+        assert r1.status_code == 200
+        assert r1.headers.get("x-tokenguard-dry-run") == "true"
+        assert r1.headers.get("x-tokenguard-status") is None
+
+        # Request 2 -> Would normally trip with 429, but dry_run passes through with 200 OK!
+        r2 = client.post("/v1/chat/completions", json=payload)
+        assert r2.status_code == 200
+        assert r2.headers.get("x-tokenguard-dry-run") == "true"
+        assert r2.headers.get("x-tokenguard-status") == "tripped"
+        assert "infinite agent loop detected" in r2.headers.get("x-tokenguard-reason", "")
+        assert r2.headers.get("x-tokenguard-tokens-saved") is not None
+        assert int(r2.headers.get("x-tokenguard-tokens-saved")) > 0
+        assert r2.headers.get("x-tokenguard-usd-saved") is not None
+        assert float(r2.headers.get("x-tokenguard-usd-saved")) > 0.0
+        assert r2.json()["choices"][0]["message"]["content"] == "Upstream response in shadow mode"
+
+        # Verify DB logged trip as blocked_loop with blocked_reason
+        reqs = client.get("/api/requests").json()["requests"]
+        assert len(reqs) >= 2
+        trip_records = [r for r in reqs if r["status"] == "blocked_loop"]
+        assert len(trip_records) == 1
+        assert "infinite agent loop detected" in trip_records[0]["blocked_reason"]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_observation_mode_anthropic_messages(tmp_path: Path, monkeypatch):
+    """Verify that in dry_run mode, Anthropic /v1/messages passes tripped requests through upstream."""
+    db_file = tmp_path / "test_dryrun_anthropic.db"
+    dry_settings = Settings(
+        host="127.0.0.1",
+        port=8080,
+        loop_threshold=2,
+        db_path=db_file,
+        dry_run=True,
+    )
+    set_settings(dry_settings)
+    app = create_app(dry_settings)
+
+    with TestClient(app) as client:
+        mock_response = {
+            "id": "msg_dryrun_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Anthropic upstream shadow answer"}],
+            "model": "claude-3-5-sonnet-20241022",
+            "usage": {"input_tokens": 60, "output_tokens": 25},
+        }
+
+        async def mock_post(url, json=None, headers=None):
+            return httpx.Response(status_code=200, json=mock_response, headers={"Content-Type": "application/json"})
+
+        monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
+
+        payload = {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Anthropic loop trip prompt"}],
+        }
+
+        # Request 1 -> 200 OK
+        r1 = client.post("/v1/messages", json=payload, headers={"x-api-key": "test-key"})
+        assert r1.status_code == 200
+        assert r1.headers.get("x-tokenguard-dry-run") == "true"
+
+        # Request 2 -> Tripped, but passes through with 200 OK
+        r2 = client.post("/v1/messages", json=payload, headers={"x-api-key": "test-key"})
+        assert r2.status_code == 200
+        assert r2.headers.get("x-tokenguard-dry-run") == "true"
+        assert r2.headers.get("x-tokenguard-status") == "tripped"
+        assert r2.headers.get("x-tokenguard-tokens-saved") is not None
+        assert r2.headers.get("x-tokenguard-usd-saved") is not None
+        assert r2.json()["content"][0]["text"] == "Anthropic upstream shadow answer"
+
+        # Verify DB recorded the trip
+        reqs = client.get("/api/requests").json()["requests"]
+        assert len(reqs) >= 2
+        trip_records = [r for r in reqs if r["status"] == "blocked_loop"]
+        assert len(trip_records) == 1
+        assert "infinite agent loop detected" in trip_records[0]["blocked_reason"]
+
 
 
 

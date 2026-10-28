@@ -130,6 +130,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="SQLite database path for request logging (default: tokenguard.db)",
     )
     run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run in observation mode (detect and log trips, but pass requests through upstream)",
+    )
+    run_parser.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
         help="Command and arguments to execute (e.g. python agent.py or pytest)",
@@ -207,7 +212,13 @@ def create_parser() -> argparse.ArgumentParser:
 
     # 13. Simulate command
     sim_parser = subparsers.add_parser("simulate", help="Run instant circuit breaker simulation")
-    sim_parser.add_argument("--type", type=str, default="loop", choices=["loop", "budget", "success"], help="Simulation type")
+    sim_parser.add_argument(
+        "--type",
+        type=str,
+        default="loop",
+        choices=["loop", "budget", "success", "tool_loop", "alternating_loop"],
+        help="Simulation type (default: loop; choices: loop, budget, success, tool_loop, alternating_loop)",
+    )
     sim_parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for simulation")
     sim_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     sim_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
@@ -251,6 +262,29 @@ def create_parser() -> argparse.ArgumentParser:
         help="Proxy host address (default: 127.0.0.1)",
     )
     export_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Proxy port (default: 8080)",
+    )
+
+    # 15. Env command (Terminal Environment Injector)
+    env_parser = subparsers.add_parser(
+        "env",
+        help="Print shell export/unset commands to route LLM SDKs through TokenGuard",
+    )
+    env_parser.add_argument(
+        "--unset",
+        action="store_true",
+        help="Print shell commands to unset TokenGuard environment variables",
+    )
+    env_parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Proxy host address (default: localhost)",
+    )
+    env_parser.add_argument(
         "--port",
         type=int,
         default=8080,
@@ -307,6 +341,11 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         help="Run in passive observability mode (no loop or budget cutoffs)",
     )
     p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run in observation mode (detect and log trips, but pass requests through upstream)",
+    )
+    p.add_argument(
         "--max-repeats",
         "--loop-threshold",
         dest="loop_threshold",
@@ -339,7 +378,14 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def print_banner(host: str, port: int, limit: float, loop_threshold: int, max_burn_rate: Optional[str] = None) -> None:
+def print_banner(
+    host: str,
+    port: int,
+    limit: float,
+    loop_threshold: int,
+    max_burn_rate: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
     """Display the clean Rich TokenGuard terminal startup banner."""
     base_url = f"http://{host}:{port}"
     loop_str = f"Enabled [dim](cutoff: {loop_threshold})[/dim]" if loop_threshold > 0 else "[yellow]Disabled (Passive)[/yellow]"
@@ -354,11 +400,15 @@ def print_banner(host: str, port: int, limit: float, loop_threshold: int, max_bu
     if max_burn_rate:
         table.add_row("Burn Rate Limit:", f"[bold white]{max_burn_rate}[/bold white]")
     table.add_row("Loop Breaker:", loop_str)
+    if dry_run:
+        table.add_row("Observation Mode:", "[bold yellow]Active (Dry Run / Pass-through)[/bold yellow]")
+
+    subtitle = "[bold yellow]● OBSERVATION MODE (DRY-RUN)[/bold yellow]" if dry_run else "[bold green]● ACTIVE & GUARDING[/bold green]"
 
     panel = Panel(
         table,
-        title="[bold bright_white]TokenGuard[/bold bright_white] [dim]v0.1.0[/dim]",
-        subtitle="[bold green]● ACTIVE & GUARDING[/bold green]",
+        title="[bold bright_white]TokenGuard[/bold bright_white] [dim]v0.2.0[/dim]",
+        subtitle=subtitle,
         box=box.ROUNDED,
         border_style="bright_black",
         padding=(1, 2),
@@ -424,6 +474,7 @@ def start_daemon(
     db_path: Path = Path("tokenguard.db"),
     passive: bool = False,
     max_burn_rate: Optional[str] = None,
+    dry_run: bool = False,
 ) -> int:
     """Spawn TokenGuard proxy in background as a daemon process."""
     existing_pid = get_daemon_pid()
@@ -456,6 +507,8 @@ def start_daemon(
     ]
     if passive:
         cmd.append("--passive")
+    if dry_run:
+        cmd.append("--dry-run")
     if max_burn_rate:
         cmd.extend(["--max-burn-rate", str(max_burn_rate)])
 
@@ -1337,6 +1390,7 @@ def cmd_logs(args: argparse.Namespace) -> None:
 def cmd_start(args: argparse.Namespace) -> None:
     """Start the proxy server and dashboard in foreground or daemon mode."""
     is_passive = getattr(args, "passive", False)
+    is_dry_run = getattr(args, "dry_run", False)
     limit = 1000.0 if is_passive else args.limit
     daily_limit = 5000.0 if is_passive else args.daily_limit
     loop_threshold = 0 if is_passive else args.loop_threshold
@@ -1354,6 +1408,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 db_path=args.db_path,
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
+                dry_run=is_dry_run,
             )
 
         if wait_for_server(args.host, args.port, timeout=5.0):
@@ -1361,12 +1416,19 @@ def cmd_start(args: argparse.Namespace) -> None:
             table.add_column(style="dim", justify="right", no_wrap=True)
             table.add_column(style="bright_white", no_wrap=True)
 
-            status_text = "[bold yellow]● ACTIVE (PASSIVE MONITOR)[/bold yellow]" if is_passive else "[bold green]● ACTIVE & GUARDING[/bold green]"
+            if is_dry_run:
+                status_text = "[bold yellow]● ACTIVE (OBSERVATION / DRY-RUN)[/bold yellow]"
+            elif is_passive:
+                status_text = "[bold yellow]● ACTIVE (PASSIVE MONITOR)[/bold yellow]"
+            else:
+                status_text = "[bold green]● ACTIVE & GUARDING[/bold green]"
             table.add_row("Status:", status_text)
             table.add_row("Proxy URL:", f"[cyan]http://{args.host}:{args.port}/v1[/cyan]")
             table.add_row("Dashboard:", f"[bold cyan]http://{args.host}:{args.port}[/bold cyan]")
             table.add_row("Process PID:", f"[dim]{pid}[/dim]")
             table.add_row("Log File:", f"[dim]{LOG_FILE}[/dim]")
+            if is_dry_run:
+                table.add_row("Observation Mode:", "[yellow]Dry Run (Shadow Mode)[/yellow]")
 
             panel = Panel(
                 table,
@@ -1395,6 +1457,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         db_path=args.db_path,
         profile="passive" if is_passive else "careful",
         passive=is_passive,
+        dry_run=is_dry_run,
     )
     set_settings(settings)
 
@@ -1404,6 +1467,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         limit=settings.hourly_limit,
         loop_threshold=settings.loop_threshold,
         max_burn_rate=settings.max_burn_rate,
+        dry_run=is_dry_run,
     )
 
     uvicorn.run(
@@ -1439,6 +1503,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8080)
     is_passive = getattr(args, "passive", False)
+    is_dry_run = getattr(args, "dry_run", False)
     limit = 1000.0 if is_passive else getattr(args, "limit", 5.0)
     daily_limit = 5000.0 if is_passive else getattr(args, "daily_limit", 50.0)
     loop_threshold = 0 if is_passive else getattr(args, "loop_threshold", 3)
@@ -1457,6 +1522,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 db_path=getattr(args, "db_path", Path("tokenguard.db")),
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
+                dry_run=is_dry_run,
             )
 
         if not is_server_running(host, port):
@@ -1802,6 +1868,193 @@ def cmd_export(args: argparse.Namespace) -> None:
     )
 
 
+def _render_alternating_loop_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    """Render interactive CLI visualization of an alternating tool ping-pong loop demo."""
+    results = data.get("results", [])
+    tripped = data.get("tripped", False)
+    cycle_len = data.get("cycle_length", 2)
+    pattern = data.get("pattern", ["read_file", "bash"])
+    pattern_display = " ➔ ".join(pattern)
+
+    table = Table(
+        title="TokenGuard Circuit Breaker — Alternating Loop (A-B-A-B) Demo",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        expand=False,
+    )
+    table.add_column("Step", justify="center", style="bold")
+    table.add_column("Tool", style="cyan")
+    table.add_column("Arguments", style="dim")
+    table.add_column("Action / Status", justify="left")
+
+    for item in results:
+        step = str(item.get("attempt") or item.get("step") or "")
+        tool = item.get("tool", "")
+        args_str = json.dumps(item.get("args", {}))
+        status = item.get("status", "")
+        if status == "allowed":
+            status_text = "[bold green]ALLOWED (200 OK)[/bold green]"
+        else:
+            status_text = "[bold red]⚡ BLOCKED (429 Circuit Breaker Tripped)[/bold red]"
+        table.add_row(step, tool, args_str, status_text)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    trip_detail = data.get("details", {})
+    err_msg = trip_detail.get("message") or "Tool ping-pong cycle detected"
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    panel_body = (
+        f"[bold red]● Circuit Breaker Tripped: Alternating Ping-Pong Loop Intercepted[/bold red]\n\n"
+        f"[bold white]Pattern:[/bold white] [cyan]{pattern_display} ➔ {pattern_display}[/cyan] (Cycle length: {cycle_len})\n"
+        f"[bold white]Detection:[/bold white] {err_msg}\n"
+        f"[bold white]Outcome:[/bold white] Call #4 intercepted locally before reaching upstream LLM\n"
+        f"[bold green]Avoided Cost:[/bold green] +$0.0105 estimated saved spend\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Circuit Breaker: A-B-A-B Trip Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="red" if tripped else "green",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def cmd_simulate(args: argparse.Namespace) -> None:
+    """Run circuit breaker simulation to demo protection mechanisms."""
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8080)
+    sim_type = getattr(args, "type", "loop")
+    sim_model = getattr(args, "model", "gpt-4o")
+
+    if sim_type in ("alternating_loop", "alternating"):
+        # Check if live proxy server is responding
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "alternating_loop", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "alternating_loop" and data.get("results"):
+                            _render_alternating_loop_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass  # Fall back to local simulation
+
+        # Local in-process simulation demo (A-B-A-B cycle)
+        from tokenguard.guard import CircuitBreaker, ToolPingPongError
+        guard = CircuitBreaker(tool_loop_threshold=3)
+        session_id = f"demo_alt_{int(time.time())}"
+        sequence = [
+            ("read_file", {"path": "server.py"}),
+            ("bash", {"command": "python server.py"}),
+            ("read_file", {"path": "server.py"}),
+            ("bash", {"command": "python server.py"}),
+        ]
+        results = []
+        cycle_detected = False
+        trip_info = {}
+
+        for i, (tool_name, tool_args) in enumerate(sequence, start=1):
+            try:
+                guard.check_tool_loop(session_id, tool_name, tool_args)
+                guard.record_tool_call(session_id, tool_name, tool_args)
+                results.append({
+                    "attempt": i,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "status": "allowed",
+                })
+            except ToolPingPongError as err:
+                cycle_detected = True
+                trip_info = {
+                    "tool": err.tool_name,
+                    "cycle_length": err.cycle_length,
+                    "pattern": err.pattern,
+                    "message": err.message,
+                }
+                results.append({
+                    "attempt": i,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "status": "blocked_tool_loop",
+                    "cycle_length": err.cycle_length,
+                    "pattern": err.pattern,
+                    "message": err.message,
+                })
+
+        data = {
+            "simulation": "alternating_loop",
+            "tripped": cycle_detected,
+            "cycle_length": 2,
+            "pattern": ["read_file", "bash"],
+            "results": results,
+            "details": trip_info,
+        }
+        _render_alternating_loop_demo(data, is_local=True)
+        return
+
+    # Standard simulations (loop, budget, success, tool_loop)
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            res = client.post(
+                f"http://{host}:{port}/api/simulate",
+                json={"type": sim_type, "model": sim_model},
+            )
+            if res.status_code == 200:
+                console.print(
+                    Panel(
+                        f"[bold green]● Simulation Completed[/bold green]\n\n"
+                        f"[dim]Type:[/dim] {sim_type}  ·  [dim]Model:[/dim] {sim_model}\n"
+                        f"[dim]Response:[/dim] {res.json()}",
+                        title="[bold bright_white]TokenGuard Simulation[/bold bright_white]",
+                        box=box.ROUNDED,
+                        border_style="bright_black",
+                        expand=False,
+                    )
+                )
+            else:
+                err_console.print(f"[bold red]Simulation failed: {res.text}[/bold red]")
+    except Exception as e:
+        err_console.print(f"[bold red]Error running simulation: {e}[/bold red]")
+
+
+def cmd_env(args: argparse.Namespace) -> None:
+    """Print shell environment export or unset commands to route LLM SDKs through TokenGuard."""
+    unset = getattr(args, "unset", False)
+    host = getattr(args, "host", "localhost")
+    port = getattr(args, "port", 8080)
+
+    if unset:
+        print("unset OPENAI_BASE_URL ANTHROPIC_BASE_URL")
+        sys.stderr.write("# Run this command to restore direct upstream connections:\n# eval $(tokenguard env --unset)\n")
+    else:
+        print(f'export OPENAI_BASE_URL="http://{host}:{port}/v1" ANTHROPIC_BASE_URL="http://{host}:{port}"')
+        sys.stderr.write("# Run this command to route OpenAI & Anthropic SDKs through TokenGuard:\n# eval $(tokenguard env)\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+
 def main() -> None:
     """Main CLI entrypoint."""
     parser = create_parser()
@@ -1809,6 +2062,8 @@ def main() -> None:
 
     if args.command == "run":
         cmd_run(args)
+    elif args.command == "env":
+        cmd_env(args)
     elif args.command == "stop":
         stop_daemon(host=args.host, port=args.port)
     elif args.command == "status":
@@ -1820,29 +2075,7 @@ def main() -> None:
         console.print(f"[dim]Opening web dashboard in default browser:[/dim] [bold cyan]{url}[/bold cyan]")
         webbrowser.open(url)
     elif args.command == "simulate":
-        host = getattr(args, "host", "127.0.0.1")
-        port = getattr(args, "port", 8080)
-        sim_type = getattr(args, "type", "loop")
-        sim_model = getattr(args, "model", "gpt-4o")
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                res = client.post(f"http://{host}:{port}/api/simulate", json={"type": sim_type, "model": sim_model})
-                if res.status_code == 200:
-                    console.print(
-                        Panel(
-                            f"[bold green]● Simulation Completed[/bold green]\n\n"
-                            f"[dim]Type:[/dim] {sim_type}  ·  [dim]Model:[/dim] {sim_model}\n"
-                            f"[dim]Response:[/dim] {res.json()}",
-                            title="[bold bright_white]TokenGuard Simulation[/bold bright_white]",
-                            box=box.ROUNDED,
-                            border_style="bright_black",
-                            expand=False,
-                        )
-                    )
-                else:
-                    err_console.print(f"[bold red]Simulation failed: {res.text}[/bold red]")
-        except Exception as e:
-            err_console.print(f"[bold red]Error running simulation: {e}[/bold red]")
+        cmd_simulate(args)
     elif args.command == "export":
         cmd_export(args)
     elif args.command == "kill":

@@ -447,6 +447,253 @@ def test_tool_ping_pong_in_messages_history():
         guard.check_request(messages, "gpt-4o", session_id="msg-history-session")
 
 
+def test_tool_cycle_normal_varied_calls_pass():
+    """Verify that varied tool calls with different tools and arguments pass without tripping."""
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-normal-calls"
+
+    calls = [
+        ("read_file", {"path": "src/main.py"}),
+        ("bash", {"command": "pytest tests/"}),
+        ("search", {"query": "AttributeError in runner"}),
+        ("git_status", {}),
+        ("edit_file", {"path": "src/main.py", "diff": "+ fix"}),
+        ("bash", {"command": "git commit -m 'fix'"}),
+    ]
+
+    for tool_name, args in calls:
+        guard.check_tool_loop(session, tool_name, args)
+        guard.record_tool_call(session, tool_name, args)
+
+    assert len(guard._tool_history[session]) == 6
+
+
+def test_tool_cycle_standard_consecutive_loop_trips():
+    """Verify standard consecutive loop (A-A-A) trips ToolPingPongError immediately on 3rd call."""
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-consecutive-loop"
+
+    tool = "read_file"
+    args = {"path": "missing_config.yaml"}
+
+    # Call 1 (A): passes
+    guard.check_tool_loop(session, tool, args)
+    guard.record_tool_call(session, tool, args)
+
+    # Call 2 (A): passes
+    guard.check_tool_loop(session, tool, args)
+    guard.record_tool_call(session, tool, args)
+
+    # Call 3 (A): trips circuit breaker!
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, tool, args)
+
+    err = exc_info.value
+    assert err.code == "TOOL_PING_PONG_LOOP"
+    assert err.status_code == 429
+    assert err.tool_name == "read_file"
+    assert err.repeats == 3
+    assert err.cycle_length == 1
+    assert err.to_dict()["error"]["code"] == "TOOL_PING_PONG_LOOP"
+
+
+def test_tool_cycle_alternating_loop_trips():
+    """Verify alternating oscillating tool calls (A-B-A-B) trip ToolPingPongError on 4th call."""
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-alternating-loop"
+
+    tool_a = ("read_file", {"path": "server.py"})
+    tool_b = ("bash", {"command": "python server.py"})
+
+    # Call 1 (A): passes
+    guard.check_tool_loop(session, tool_a[0], tool_a[1])
+    guard.record_tool_call(session, tool_a[0], tool_a[1])
+
+    # Call 2 (B): passes
+    guard.check_tool_loop(session, tool_b[0], tool_b[1])
+    guard.record_tool_call(session, tool_b[0], tool_b[1])
+
+    # Call 3 (A): passes
+    guard.check_tool_loop(session, tool_a[0], tool_a[1])
+    guard.record_tool_call(session, tool_a[0], tool_a[1])
+
+    # Call 4 (B): alternating loop A-B-A-B detected -> trips!
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, tool_b[0], tool_b[1])
+
+    err = exc_info.value
+    assert err.code == "TOOL_PING_PONG_LOOP"
+    assert err.status_code == 429
+    assert err.cycle_length == 2
+    assert err.pattern == ["read_file", "bash"]
+    assert "alternating" in err.message.lower()
+    err_dict = err.to_dict()["error"]
+    assert err_dict["code"] == "TOOL_PING_PONG_LOOP"
+    assert err_dict["cycle_length"] == 2
+    assert err_dict["pattern"] == ["read_file", "bash"]
+
+
+def test_tool_cycle_length_3_trips():
+    """Verify 3-step cycle (A-B-C-A-B-C) trips ToolPingPongError on 6th call."""
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "agent-length-3-loop"
+
+    tool_a = ("read_file", {"path": "module.py"})
+    tool_b = ("bash", {"command": "cat module.py"})
+    tool_c = ("search", {"query": "module syntax error"})
+
+    sequence = [tool_a, tool_b, tool_c, tool_a, tool_b]
+    for t_name, t_args in sequence:
+        guard.check_tool_loop(session, t_name, t_args)
+        guard.record_tool_call(session, t_name, t_args)
+
+    # 6th call (C completes A-B-C-A-B-C cycle) -> trips!
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, tool_c[0], tool_c[1])
+
+    err = exc_info.value
+    assert err.code == "TOOL_PING_PONG_LOOP"
+    assert err.status_code == 429
+    assert err.cycle_length == 3
+    assert err.pattern == ["read_file", "bash", "search"]
+
+
+def test_tool_cycle_in_messages_alternating():
+    """Verify alternating tool calls inside conversation messages history trip circuit breaker."""
+    from tokenguard.guard import ToolPingPongError
+    guard = CircuitBreaker(tool_loop_threshold=3)
+
+    messages = [
+        {"role": "user", "content": "Debug server failure"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "server.py"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "SyntaxError: line 42"},
+        {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "bash", "arguments": '{"command": "python server.py"}'}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "Process failed with code 1"},
+        {"role": "assistant", "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "server.py"}'}}]},
+        {"role": "tool", "tool_call_id": "c3", "content": "SyntaxError: line 42"},
+        {"role": "assistant", "tool_calls": [{"id": "c4", "type": "function", "function": {"name": "bash", "arguments": '{"command": "python server.py"}'}}]},
+    ]
+
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_request(messages, "gpt-4o", session_id="agent-msg-alt")
+
+    assert exc_info.value.code == "TOOL_PING_PONG_LOOP"
+    assert exc_info.value.cycle_length == 2
+
+
+def test_prompt_cycle_alternating_loop_trips():
+    """Verify prompt-level alternating loops (A-B-A-B) trip LoopDetectedError."""
+    from tokenguard.guard import LoopDetectedError
+    guard = CircuitBreaker(loop_threshold=3)
+
+    msg_a = [{"role": "user", "content": "Prompt Alpha"}]
+    msg_b = [{"role": "user", "content": "Prompt Beta"}]
+
+    # A -> B -> A
+    guard.check_request(msg_a, "gpt-4o", session_id="sess-alt-prompt")
+    guard.check_request(msg_b, "gpt-4o", session_id="sess-alt-prompt")
+    guard.check_request(msg_a, "gpt-4o", session_id="sess-alt-prompt")
+
+    # Next B completes A-B-A-B -> trips!
+    with pytest.raises(LoopDetectedError) as exc_info:
+        guard.check_request(msg_b, "gpt-4o", session_id="sess-alt-prompt")
+
+    assert exc_info.value.status_code == 429
+    assert "infinite agent loop detected" in exc_info.value.message
+
+
+def test_tool_history_sliding_window_maxlen():
+    """Verify sliding window of recent call signatures is bounded to maxlen=10 per session."""
+    guard = CircuitBreaker()
+    session = "agent-sliding-bound"
+
+    for i in range(25):
+        guard.record_tool_call(session, f"tool_{i}", {"index": i})
+
+    assert len(guard._tool_history[session]) == 10
+    last_entry = guard._tool_history[session][-1]
+    assert last_entry[1] == "tool_24"
+
+
+def test_normalize_tool_arguments_strips_dynamic_nonces():
+    """Verify normalize_tool_arguments strips call_id, timestamp, ts, nonce, _id, request_id."""
+    from tokenguard.guard import normalize_tool_arguments
+
+    args_dict = {
+        "command": "curl http://127.0.0.1/health",
+        "call_id": "call_abc123",
+        "timestamp": "2026-10-28T12:00:00Z",
+        "ts": 1714000000,
+        "nonce": "xyz987",
+        "_id": "doc_456",
+        "request_id": "req-999",
+        "timeout": 30,
+    }
+
+    norm_str, clean_obj = normalize_tool_arguments(args_dict)
+    assert "call_id" not in clean_obj
+    assert "timestamp" not in clean_obj
+    assert "ts" not in clean_obj
+    assert "nonce" not in clean_obj
+    assert "_id" not in clean_obj
+    assert "request_id" not in clean_obj
+    assert clean_obj == {"command": "curl http://127.0.0.1/health", "timeout": 30}
+    assert norm_str == '{"command":"curl http://127.0.0.1/health","timeout":30}'
+
+
+def test_normalize_tool_arguments_json_string_with_nested_nonces():
+    """Verify JSON string inputs and nested structures have nonces stripped recursively."""
+    import json
+    from tokenguard.guard import normalize_tool_arguments
+
+    raw_json = json.dumps({
+        "file": "main.py ",
+        "meta": {
+            "request_id": "req-1",
+            "timestamp": 12345,
+            "line": 42,
+        },
+        "items": [
+            {"_id": "1", "name": "foo "},
+            {"nonce": "n1", "name": "bar"},
+        ],
+    })
+
+    norm_str, clean_obj = normalize_tool_arguments(raw_json)
+    assert clean_obj["file"] == "main.py"
+    assert "request_id" not in clean_obj["meta"]
+    assert "timestamp" not in clean_obj["meta"]
+    assert clean_obj["meta"] == {"line": 42}
+    assert clean_obj["items"] == [{"name": "foo"}, {"name": "bar"}]
+
+
+def test_tool_loop_detection_trips_across_varying_dynamic_nonces():
+    """Verify tool loop circuit breaker catches repetitive calls even when nonces/timestamps vary."""
+    from tokenguard.guard import CircuitBreaker, ToolPingPongError
+
+    guard = CircuitBreaker(tool_loop_threshold=3)
+    session = "sess-nonce-test"
+
+    call1 = {"path": "/workspace/config.json", "call_id": "call-1", "ts": 1000, "nonce": "n1"}
+    call2 = {"path": "/workspace/config.json", "call_id": "call-2", "ts": 1001, "nonce": "n2"}
+    call3 = {"path": "/workspace/config.json", "call_id": "call-3", "ts": 1002, "nonce": "n3"}
+
+    guard.check_tool_loop(session, "read_file", call1)
+    guard.record_tool_call(session, "read_file", call1)
+
+    guard.check_tool_loop(session, "read_file", call2)
+    guard.record_tool_call(session, "read_file", call2)
+
+    with pytest.raises(ToolPingPongError) as exc_info:
+        guard.check_tool_loop(session, "read_file", call3)
+
+    assert exc_info.value.tool_name == "read_file"
+    assert exc_info.value.repeats == 3
+
+
 
 
 

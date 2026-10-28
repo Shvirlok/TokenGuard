@@ -13,6 +13,14 @@ const STYLES: Record<string, { label: string; className: string }> = {
     label: 'TOOL RETRY LOOP: HARD STOP',
     className: 'border-rose-500/80 bg-rose-950/60 text-rose-300 font-bold',
   },
+  blocked_burn_rate: {
+    label: '429 BURN RATE SPIKE',
+    className: 'border-amber-500/80 bg-amber-950/60 text-amber-300 font-bold',
+  },
+  blocked_context_ballooning: {
+    label: '429 CONTEXT RUNAWAY',
+    className: 'border-rose-500/80 bg-rose-950/60 text-rose-300 font-bold',
+  },
   blocked_budget: {
     label: '429 OVER BUDGET',
     className: 'border-amber-900/60 bg-amber-950/30 text-amber-400',

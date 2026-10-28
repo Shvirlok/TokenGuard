@@ -299,6 +299,7 @@ def get_guard() -> CircuitBreaker:
             active_profile=settings.profile,
             max_burn_rate=settings.max_burn_rate,
             enable_context_ballooning=settings.enable_context_ballooning,
+            dry_run=settings.dry_run,
         )
     return circuit_breaker
 
@@ -336,6 +337,7 @@ async def lifespan(app: FastAPI):
         active_profile=settings.profile,
         max_burn_rate=settings.max_burn_rate,
         enable_context_ballooning=settings.enable_context_ballooning,
+        dry_run=settings.dry_run,
     )
 
     # Seed recent spends from SQLite to back sliding window burn-rate engine
@@ -366,6 +368,7 @@ async def _record_and_broadcast_request(
     prompt_hash: Optional[str],
     status: str,
     blocked_reason: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> int:
     """Log an LLM request to SQLite and broadcast a real-time event to all SSE clients."""
     rec_id = await log_request(
@@ -378,6 +381,7 @@ async def _record_and_broadcast_request(
         prompt_hash=prompt_hash,
         status=status,
         blocked_reason=blocked_reason,
+        session_id=session_id,
     )
     req_payload = {
         "id": rec_id,
@@ -391,6 +395,7 @@ async def _record_and_broadcast_request(
         "prompt_hash": prompt_hash,
         "status": status,
         "blocked_reason": blocked_reason,
+        "session_id": session_id,
     }
     await broadcaster.broadcast("request_logged", req_payload)
     return rec_id
@@ -545,6 +550,23 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def add_tokenguard_headers(request: Request, call_next):
+        response = await call_next(request)
+        curr_settings = get_settings()
+        is_dry = getattr(curr_settings, "dry_run", False) or (circuit_breaker and getattr(circuit_breaker, "dry_run", False))
+        if is_dry:
+            response.headers["X-TokenGuard-Dry-Run"] = "true"
+        if getattr(request.state, "dry_run_tripped", False):
+            response.headers["X-TokenGuard-Status"] = "tripped"
+            if getattr(request.state, "trip_reason", None):
+                response.headers["X-TokenGuard-Reason"] = str(request.state.trip_reason).replace("\n", " ").strip()
+            if getattr(request.state, "tokens_saved", None) is not None:
+                response.headers["X-TokenGuard-Tokens-Saved"] = str(request.state.tokens_saved)
+            if getattr(request.state, "usd_saved", None) is not None:
+                response.headers["X-TokenGuard-USD-Saved"] = f"{request.state.usd_saved:.4f}"
+        return response
 
     # Ensure static directory exists
     static_dir = Path(settings.static_path)
@@ -932,6 +954,77 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
             return {"simulation": "tool_loop", "results": results, "threshold": circuit_breaker.tool_loop_threshold}
 
+        elif sim_type in ("alternating_loop", "alternating"):
+            tool_a = ("read_file", {"path": "server.py"})
+            tool_b = ("bash", {"command": "python server.py"})
+            sim_session = f"sim_alt_{int(time.time())}"
+            sequence = [tool_a, tool_b, tool_a, tool_b]
+            results = []
+            cycle_detected = False
+            trip_info = {}
+
+            for i, (tool_name, tool_args) in enumerate(sequence, start=1):
+                try:
+                    circuit_breaker.check_tool_loop(sim_session, tool_name, tool_args)
+                    circuit_breaker.record_tool_call(sim_session, tool_name, tool_args)
+                    cost = circuit_breaker.compute_cost(model, 100, 50)
+                    circuit_breaker.record_success(model, 100, 50, cost, prompt_hash=f"sim_alt_{i}", session_id=sim_session)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=100,
+                        completion_tokens=50,
+                        cost_usd=cost,
+                        latency_ms=120 + i * 20,
+                        prompt_hash=f"sim_alt_{i}",
+                        status="success",
+                        session_id=sim_session,
+                    )
+                    results.append({
+                        "attempt": i,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "status": "allowed",
+                    })
+                except ToolPingPongError as err:
+                    cycle_detected = True
+                    trip_info = {
+                        "tool": err.tool_name,
+                        "cycle_length": err.cycle_length,
+                        "pattern": err.pattern,
+                        "message": err.message,
+                    }
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=100,
+                        completion_tokens=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=f"sim_alt_{i}",
+                        status="blocked_tool_loop",
+                        blocked_reason=err.message,
+                        session_id=sim_session,
+                    )
+                    results.append({
+                        "attempt": i,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "status": "blocked_tool_loop",
+                        "cycle_length": err.cycle_length,
+                        "pattern": err.pattern,
+                        "message": err.message,
+                    })
+
+            return {
+                "simulation": "alternating_loop",
+                "tripped": cycle_detected,
+                "cycle_length": 2,
+                "pattern": ["read_file", "bash"],
+                "results": results,
+                "details": trip_info,
+            }
+
         elif sim_type == "success":
             sample_messages = [{"role": "user", "content": f"Simulated user prompt #{int(time.time())}"}]
             prompt_hash = circuit_breaker.compute_prompt_hash(sample_messages)
@@ -1137,7 +1230,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         session_id = (
             request.headers.get("x-session-id")
             or request.headers.get("session-id")
+            or request.headers.get("x-agent-id")
+            or request.headers.get("agent-id")
             or (body.get("metadata", {}).get("user_id") if isinstance(body.get("metadata"), dict) else None)
+            or (body.get("metadata", {}).get("agent_id") if isinstance(body.get("metadata"), dict) else None)
             or "default"
         )
         has_task_update = _detect_task_update(request.headers, body, check_payload)
@@ -1168,35 +1264,78 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             elif cb_err.error_type == "kill_switch_active":
                 status_tag = "blocked_killswitch"
 
+            est_tokens = circuit_breaker.estimate_prompt_tokens(check_payload)
+            tokens_saved = getattr(cb_err, "tokens_saved", None)
+            usd_saved = getattr(cb_err, "usd_saved", None)
+            if tokens_saved is None or usd_saved is None:
+                t_saved, u_saved = circuit_breaker.calculate_saved_telemetry(
+                    model=model,
+                    messages=check_payload,
+                    session_id=session_id,
+                    prompt_tokens=est_tokens,
+                )
+                tokens_saved = tokens_saved if tokens_saved is not None else t_saved
+                usd_saved = usd_saved if usd_saved is not None else u_saved
+
             await _record_and_broadcast_request(
                 db_path=current_settings.db_path,
                 model=model,
-                prompt_tokens=circuit_breaker.estimate_prompt_tokens(check_payload),
+                prompt_tokens=est_tokens,
                 completion_tokens=0,
                 cost_usd=0.0,
                 latency_ms=0,
                 prompt_hash=prompt_hash,
                 status=status_tag,
                 blocked_reason=cb_err.message,
+                session_id=session_id,
             )
 
-            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+            is_dry_run = getattr(current_settings, "dry_run", False) or getattr(circuit_breaker, "dry_run", False)
+            if is_dry_run:
+                logger.warning(
+                    f"[DRY-RUN SHADOW MODE] Detected trip ({status_tag}): {cb_err.message} — passing request through to upstream"
+                )
+                request.state.dry_run_tripped = True
+                request.state.trip_reason = cb_err.message
+                request.state.tokens_saved = tokens_saved
+                request.state.usd_saved = usd_saved
+            else:
+                resp_headers = {
+                    "X-TokenGuard-Status": "tripped",
+                    "X-TokenGuard-Reason": str(cb_err.message).replace("\n", " ").strip(),
+                    "X-TokenGuard-Tokens-Saved": str(tokens_saved),
+                    "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
+                }
+
+                if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+                    err_dict = cb_err.to_dict()
+                    if "error" in err_dict and isinstance(err_dict["error"], dict):
+                        err_dict["error"]["tokens_saved"] = tokens_saved
+                        err_dict["error"]["usd_saved"] = usd_saved
+                    err_dict["tokens_saved"] = tokens_saved
+                    err_dict["usd_saved"] = usd_saved
+                    return JSONResponse(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        content=err_dict,
+                        headers=resp_headers,
+                    )
+
+                # Return Anthropic-native error schema
                 return JSONResponse(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    content=cb_err.to_dict(),
-                )
-
-            # Return Anthropic-native error schema
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content={
-                    "type": "error",
-                    "error": {
-                        "type": "rate_limit_error",
-                        "message": cb_err.message,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": cb_err.message,
+                            "tokens_saved": tokens_saved,
+                            "usd_saved": usd_saved,
+                        },
+                        "tokens_saved": tokens_saved,
+                        "usd_saved": usd_saved,
                     },
-                },
-            )
+                    headers=resp_headers,
+                )
 
         # 3. Resolve Destination and Headers
         target_url = resolve_upstream_url("anthropic", endpoint="messages")
@@ -1269,7 +1408,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         session_id = (
             request.headers.get("x-session-id")
             or request.headers.get("session-id")
+            or request.headers.get("x-agent-id")
+            or request.headers.get("agent-id")
             or body.get("user")
+            or (body.get("metadata", {}).get("user_id") if isinstance(body.get("metadata"), dict) else None)
+            or (body.get("metadata", {}).get("agent_id") if isinstance(body.get("metadata"), dict) else None)
             or "default"
         )
         has_task_update = _detect_task_update(request.headers, body, messages)
@@ -1300,22 +1443,60 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             elif cb_err.error_type == "kill_switch_active":
                 status_tag = "blocked_killswitch"
 
+            est_tokens = circuit_breaker.estimate_prompt_tokens(messages)
+            tokens_saved = getattr(cb_err, "tokens_saved", None)
+            usd_saved = getattr(cb_err, "usd_saved", None)
+            if tokens_saved is None or usd_saved is None:
+                t_saved, u_saved = circuit_breaker.calculate_saved_telemetry(
+                    model=model,
+                    messages=messages,
+                    session_id=session_id,
+                    prompt_tokens=est_tokens,
+                )
+                tokens_saved = tokens_saved if tokens_saved is not None else t_saved
+                usd_saved = usd_saved if usd_saved is not None else u_saved
+
             await _record_and_broadcast_request(
                 db_path=current_settings.db_path,
                 model=model,
-                prompt_tokens=circuit_breaker.estimate_prompt_tokens(messages),
+                prompt_tokens=est_tokens,
                 completion_tokens=0,
                 cost_usd=0.0,
                 latency_ms=0,
                 prompt_hash=prompt_hash,
                 status=status_tag,
                 blocked_reason=cb_err.message,
+                session_id=session_id,
             )
 
-            return JSONResponse(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                content=cb_err.to_dict(),
-            )
+            is_dry_run = getattr(current_settings, "dry_run", False) or getattr(circuit_breaker, "dry_run", False)
+            if is_dry_run:
+                logger.warning(
+                    f"[DRY-RUN SHADOW MODE] Detected trip ({status_tag}): {cb_err.message} — passing request through to upstream"
+                )
+                request.state.dry_run_tripped = True
+                request.state.trip_reason = cb_err.message
+                request.state.tokens_saved = tokens_saved
+                request.state.usd_saved = usd_saved
+            else:
+                resp_content = cb_err.to_dict()
+                if "error" in resp_content and isinstance(resp_content["error"], dict):
+                    resp_content["error"]["tokens_saved"] = tokens_saved
+                    resp_content["error"]["usd_saved"] = usd_saved
+                resp_content["tokens_saved"] = tokens_saved
+                resp_content["usd_saved"] = usd_saved
+
+                headers = {
+                    "X-TokenGuard-Status": "tripped",
+                    "X-TokenGuard-Reason": str(cb_err.message).replace("\n", " ").strip(),
+                    "X-TokenGuard-Tokens-Saved": str(tokens_saved),
+                    "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
+                }
+                return JSONResponse(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    content=resp_content,
+                    headers=headers,
+                )
 
         # 3. Detect Provider and Resolve Routing
         provider = detect_provider(model)
@@ -1406,7 +1587,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         try:
             circuit_breaker.check_request(input_data, model)
         except CircuitBreakerError as cb_err:
-            return JSONResponse(status_code=429, content=cb_err.to_dict())
+            est_tokens = circuit_breaker.estimate_prompt_tokens(input_data)
+            tokens_saved = getattr(cb_err, "tokens_saved", None) or (est_tokens + 500)
+            usd_saved = getattr(cb_err, "usd_saved", None) or round(circuit_breaker.calculate_avoided_cost(model, est_tokens), 4)
+            is_dry_run = getattr(current_settings, "dry_run", False) or getattr(circuit_breaker, "dry_run", False)
+            if is_dry_run:
+                request.state.dry_run_tripped = True
+                request.state.trip_reason = cb_err.message
+                request.state.tokens_saved = tokens_saved
+                request.state.usd_saved = usd_saved
+            else:
+                resp_content = cb_err.to_dict()
+                if "error" in resp_content and isinstance(resp_content["error"], dict):
+                    resp_content["error"]["tokens_saved"] = tokens_saved
+                    resp_content["error"]["usd_saved"] = usd_saved
+                resp_content["tokens_saved"] = tokens_saved
+                resp_content["usd_saved"] = usd_saved
+                resp_headers = {
+                    "X-TokenGuard-Status": "tripped",
+                    "X-TokenGuard-Reason": str(cb_err.message).replace("\n", " ").strip(),
+                    "X-TokenGuard-Tokens-Saved": str(tokens_saved),
+                    "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
+                }
+                return JSONResponse(status_code=429, content=resp_content, headers=resp_headers)
 
         provider = detect_provider(model)
         target_url = f"{current_settings.upstream_url.rstrip('/')}/v1/embeddings"
