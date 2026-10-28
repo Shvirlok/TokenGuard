@@ -1,14 +1,16 @@
-# TokenGuard 
+# TokenGuard
 
-### Zero-trust local circuit breaker and real-time telemetry proxy for autonomous LLM agents
+<p align="left">
+  <b>Zero-trust local circuit breaker and real-time telemetry proxy for autonomous LLM agents.</b>
+</p>
 
-[![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg?logo=fastapi)](https://fastapi.tiangolo.com)
-[![SQLite WAL](https://img.shields.io/badge/SQLite-WAL%20Mode-003B57.svg?logo=sqlite)](https://sqlite.org)
-[![Rich TUI](https://img.shields.io/badge/Rich-Developer%20TUI-10b981.svg)](https://github.com/Textualize/rich)
-[![Providers](https://img.shields.io/badge/Providers-OpenAI%20%7C%20Claude%20%7C%20DeepSeek%20%7C%20Gemini%20%7C%20Qwen-purple.svg)](#supported-providers)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI Matrix](https://img.shields.io/badge/CI-Ubuntu%20%7C%20macOS-success.svg)](.github/workflows/ci.yml)
+<p align="left">
+  <a href="https://github.com/xerj-org/xerj"><img src="https://img.shields.io/badge/Indexed_in-XERJ_Corpus_Hub-007EC6?style=flat-square&logo=github&logoColor=white" alt="XERJ Hub"></a>
+  <img src="https://img.shields.io/badge/Status-Active_%26_Guarding-10b981?style=flat-square" alt="Status">
+  <img src="https://img.shields.io/badge/Python-3.10_%7C_3.11_%7C_3.12-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Providers-OpenAI_%7C_Claude_%7C_DeepSeek-8b5cf6?style=flat-square" alt="Providers">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square" alt="License"></a>
+</p>
 
 ---
 
