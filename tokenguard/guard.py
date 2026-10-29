@@ -1133,21 +1133,37 @@ def calculate_avoided_cost(
     return prompt_cost + completion_cost
 
 
+_MISSING = object()
+
+
 class ExpiringLRUDict(OrderedDict):
     def __init__(
         self,
         max_size: int = 1000,
         ttl_seconds: float = 3600.0,
         default_factory: Optional[Callable[[], Any]] = None,
-        *args,
-        **kwargs,
+        *args: Any,
+        **kwargs: Any,
     ):
-        super().__init__(*args, **kwargs)
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.default_factory = default_factory
-        self._timestamps = {}
+        self._timestamps: Dict[Any, float] = {}
         self._lock = RLock()
+        super().__init__()
+        if args or kwargs:
+            self.update(*args, **kwargs)
+
+    def _delete_raw(self, key: Any) -> None:
+        """Delete a key directly via OrderedDict.__delitem__ without calling OrderedDict.pop.
+
+        In Python 3.10, OrderedDict.pop(self, key, default) internally invokes
+        self.__contains__(key) and self.__getitem__(key) in C, causing infinite
+        recursion if called from __contains__ or __getitem__.
+        """
+        self._timestamps.pop(key, None)
+        if super().__contains__(key):
+            super().__delitem__(key)
 
     def __getitem__(self, key: Any) -> Any:
         with self._lock:
@@ -1160,16 +1176,16 @@ class ExpiringLRUDict(OrderedDict):
 
             now = time.time()
             if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                super().pop(key, None)
-                self._timestamps.pop(key, None)
+                self._delete_raw(key)
                 if self.default_factory is not None:
                     val = self.default_factory()
                     self[key] = val
                     return val
                 raise KeyError(key)
 
+            self._timestamps[key] = now
             try:
-                self.move_to_end(key)
+                super().move_to_end(key)
             except KeyError:
                 pass
             return super().__getitem__(key)
@@ -1181,14 +1197,20 @@ class ExpiringLRUDict(OrderedDict):
             super().__setitem__(key, value)
             self._timestamps[key] = now
             try:
-                self.move_to_end(key)
+                super().move_to_end(key)
             except KeyError:
                 pass
 
-            while len(self) > self.max_size:
-                oldest = next(iter(self))
-                super().pop(oldest, None)
-                self._timestamps.pop(oldest, None)
+            while super().__len__() > self.max_size:
+                oldest = next(super().__iter__())
+                self._delete_raw(oldest)
+
+    def __delitem__(self, key: Any) -> None:
+        with self._lock:
+            if not super().__contains__(key):
+                self._timestamps.pop(key, None)
+                raise KeyError(key)
+            self._delete_raw(key)
 
     def __contains__(self, key: Any) -> bool:
         with self._lock:
@@ -1196,21 +1218,40 @@ class ExpiringLRUDict(OrderedDict):
                 return False
             now = time.time()
             if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                super().pop(key, None)
-                self._timestamps.pop(key, None)
+                self._delete_raw(key)
                 return False
             return True
 
     def get(self, key: Any, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def pop(self, key: Any, *args) -> Any:
         with self._lock:
-            self._timestamps.pop(key, None)
-            return super().pop(key, *args)
+            if not super().__contains__(key):
+                return default
+            now = time.time()
+            if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
+                self._delete_raw(key)
+                return default
+            self._timestamps[key] = now
+            try:
+                super().move_to_end(key)
+            except KeyError:
+                pass
+            return super().__getitem__(key)
+
+    def pop(self, key: Any, default: Any = _MISSING) -> Any:
+        with self._lock:
+            if not super().__contains__(key):
+                self._timestamps.pop(key, None)
+                if default is not _MISSING:
+                    return default
+                raise KeyError(key)
+            ts = self._timestamps.pop(key, 0.0)
+            val = super().__getitem__(key)
+            super().__delitem__(key)
+            if time.time() - ts > self.ttl_seconds:
+                if default is not _MISSING:
+                    return default
+                raise KeyError(key)
+            return val
 
     def _prune(self, now: float) -> None:
         expired = [
@@ -1218,8 +1259,7 @@ class ExpiringLRUDict(OrderedDict):
             if now - ts > self.ttl_seconds
         ]
         for k in expired:
-            super().pop(k, None)
-            self._timestamps.pop(k, None)
+            self._delete_raw(k)
 
     def clear(self) -> None:
         with self._lock:
@@ -1231,7 +1271,7 @@ class ExpiringLRUDict(OrderedDict):
             now = time.time()
             if super().__contains__(key):
                 try:
-                    self.move_to_end(key)
+                    super().move_to_end(key)
                 except KeyError:
                     pass
                 self._timestamps[key] = now
