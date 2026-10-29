@@ -4,8 +4,9 @@
   <b>Zero-trust local circuit breaker and real-time telemetry proxy for autonomous LLM agents.</b>
 </p>
 
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/Shvirlok/badge.svg)](https://hub.xerj.org/contributors/Shvirlok)
+
 <p align="left">
-  <a href="https://github.com/xerj-org/xerj"><img src="https://img.shields.io/badge/Indexed_in-XERJ_Corpus_Hub-007EC6?style=flat-square&logo=github&logoColor=white" alt="XERJ Hub"></a>
   <img src="https://img.shields.io/badge/Status-Active_%26_Guarding-10b981?style=flat-square" alt="Status">
   <img src="https://img.shields.io/badge/Python-3.10_%7C_3.11_%7C_3.12-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Providers-OpenAI_%7C_Claude_%7C_DeepSeek-8b5cf6?style=flat-square" alt="Providers">
