@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("tokenguard.guard")
 
@@ -326,6 +326,94 @@ class ToolPingPongError(CircuitBreakerError):
         }
 
 
+class ToolRetryCeilingError(CircuitBreakerError):
+    """Tripped when the same tool_name is invoked >= max_tool_repeats consecutively, ignoring arguments."""
+
+    def __init__(
+        self,
+        tool_name: str,
+        repeats: int,
+        message: Optional[str] = None,
+        tokens_saved: Optional[int] = None,
+        usd_saved: Optional[float] = None,
+    ):
+        msg = message or f"ToolRetryCeilingTripped: {tool_name} called {repeats} times consecutively"
+        super().__init__(
+            message=msg,
+            error_type="circuit_breaker",
+            status_code=429,
+            code="ToolRetryCeilingTripped",
+            reason="ToolRetryCeilingTripped",
+            tool_name=tool_name,
+            repeats=repeats,
+            tokens_saved=tokens_saved,
+            usd_saved=usd_saved,
+        )
+        self.reason = "ToolRetryCeilingTripped"
+        self.tool_name = tool_name
+        self.repeats = repeats
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "type": "circuit_breaker",
+            "code": "ToolRetryCeilingTripped",
+            "reason": "ToolRetryCeilingTripped",
+            "message": self.message,
+            "tool_name": self.tool_name,
+            "repeats": self.repeats,
+        }
+        if self.tokens_saved is not None:
+            data["tokens_saved"] = self.tokens_saved
+        if self.usd_saved is not None:
+            data["usd_saved"] = self.usd_saved
+        return {
+            "reason": "ToolRetryCeilingTripped",
+            "error": data,
+        }
+
+
+class SessionStagnationError(CircuitBreakerError):
+    """Tripped when an agent executes >= max_stagnant_steps without state change or output milestones."""
+
+    def __init__(
+        self,
+        steps: int,
+        message: Optional[str] = None,
+        tokens_saved: Optional[int] = None,
+        usd_saved: Optional[float] = None,
+    ):
+        msg = message or f"SessionStagnationTripped: {steps} steps without state change"
+        super().__init__(
+            message=msg,
+            error_type="circuit_breaker",
+            status_code=429,
+            code="SessionStagnationTripped",
+            reason="SessionStagnationTripped",
+            steps=steps,
+            tokens_saved=tokens_saved,
+            usd_saved=usd_saved,
+        )
+        self.reason = "SessionStagnationTripped"
+        self.steps = steps
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "type": "circuit_breaker",
+            "code": "SessionStagnationTripped",
+            "reason": "SessionStagnationTripped",
+            "message": self.message,
+            "steps": self.steps,
+        }
+        if self.tokens_saved is not None:
+            data["tokens_saved"] = self.tokens_saved
+        if self.usd_saved is not None:
+            data["usd_saved"] = self.usd_saved
+        return {
+            "reason": "SessionStagnationTripped",
+            "error": data,
+        }
+
+
 class KillSwitchActiveError(CircuitBreakerError):
     def __init__(
         self,
@@ -431,7 +519,6 @@ def detect_cycle_in_sequence(
 
     n = len(items)
 
-    # 1. Length 1 cycle: A-A-A (three identical consecutive calls)
     if length_1_repeats >= 1 and n >= length_1_repeats:
         tail_1 = items[-length_1_repeats:]
         first = tail_1[0]
@@ -443,7 +530,6 @@ def detect_cycle_in_sequence(
                 "matched_items": list(tail_1),
             }
 
-    # 2. Length 2 cycle: A-B-A-B (alternating calls repeating twice)
     if n >= 4:
         s0, s1, s2, s3 = items[-4], items[-3], items[-2], items[-1]
         if _eq(s0, s2) and _eq(s1, s3) and not _eq(s0, s1):
@@ -454,7 +540,6 @@ def detect_cycle_in_sequence(
                 "matched_items": [s0, s1, s2, s3],
             }
 
-    # 3. Length 3 cycle: A-B-C-A-B-C (three-step sequence repeating twice)
     if n >= 6:
         s0, s1, s2, s3, s4, s5 = items[-6:]
         if _eq(s0, s3) and _eq(s1, s4) and _eq(s2, s5):
@@ -469,8 +554,158 @@ def detect_cycle_in_sequence(
     return None
 
 
+DEFAULT_MUTATING_TOOLS: frozenset[str] = frozenset({
+    "write_file",
+    "edit_file",
+    "create_file",
+    "delete_file",
+    "remove_file",
+    "move_file",
+    "rename_file",
+    "copy_file",
+    "patch_file",
+    "apply_patch",
+    "replace_in_file",
+    "str_replace_editor",
+    "multi_edit",
+    "notebook_edit",
+    "bash",
+    "sh",
+    "zsh",
+    "shell",
+    "run_command",
+    "run_terminal_cmd",
+    "execute",
+    "execute_command",
+    "exec_command",
+    "terminal",
+    "git_commit",
+    "git_push",
+    "git_checkout",
+    "git_merge",
+    "git_rebase",
+    "git_reset",
+    "sql_execute",
+    "db_write",
+    "insert",
+    "update",
+    "delete",
+    "upsert",
+    "create_issue",
+    "create_pr",
+    "post_comment",
+    "send_message",
+    "send_email",
+})
+
+_MUTATING_PREFIXES: Tuple[str, ...] = (
+    "write_",
+    "edit_",
+    "create_",
+    "delete_",
+    "remove_",
+    "update_",
+    "insert_",
+    "upsert_",
+    "patch_",
+    "apply_",
+    "exec_",
+    "execute_",
+    "run_",
+    "save_",
+    "put_",
+    "post_",
+    "send_",
+    "commit_",
+    "push_",
+    "install_",
+    "mkdir",
+    "rm_",
+    "mv_",
+)
+
+
+def is_mutating_tool(tool_name: str, custom_mutating: Optional[frozenset[str]] = None) -> bool:
+    """Return True if tool_name represents a state-changing / mutating action."""
+    if not tool_name:
+        return False
+    clean = tool_name.strip().lower()
+    if custom_mutating is not None:
+        return clean in custom_mutating
+    return clean in DEFAULT_MUTATING_TOOLS or clean.startswith(_MUTATING_PREFIXES)
+
+
+def _is_schema_tool_definition(item: Dict[str, Any]) -> bool:
+    """Return True if dict represents a JSON Schema tool definition rather than an invocation."""
+    if "input_schema" in item or "parameters" in item:
+        return True
+    fn = item.get("function")
+    if isinstance(fn, dict) and ("parameters" in fn or "input_schema" in fn):
+        return True
+    return False
+
+
+def _is_tool_result_message(msg: Dict[str, Any]) -> bool:
+    """Return True if chat message is a tool/function result frame."""
+    role = msg.get("role")
+    if role in ("tool", "function"):
+        return True
+    if role == "user":
+        content = msg.get("content")
+        if isinstance(content, list) and content:
+            return all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return False
+
+
+def _extract_raw_names_from_dict(item: Dict[str, Any]) -> List[str]:
+    """Extract raw tool names from a single message or tool-call dict without normalizing args."""
+    names: List[str] = []
+    if _is_schema_tool_definition(item):
+        return names
+
+    tool_calls = item.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict) and not _is_schema_tool_definition(tc):
+                fn = tc.get("function")
+                raw_name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                if isinstance(raw_name, str) and raw_name.strip():
+                    names.append(raw_name.strip())
+
+    fn_call = item.get("function_call")
+    if isinstance(fn_call, dict):
+        raw_name = fn_call.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name.strip())
+
+    content = item.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                raw_name = block.get("name")
+                if isinstance(raw_name, str) and raw_name.strip():
+                    names.append(raw_name.strip())
+
+    tools = item.get("tools")
+    if isinstance(tools, list):
+        for t in tools:
+            if isinstance(t, dict) and not _is_schema_tool_definition(t):
+                fn = t.get("function")
+                raw_name = fn.get("name") if isinstance(fn, dict) else t.get("name")
+                if isinstance(raw_name, str) and raw_name.strip():
+                    names.append(raw_name.strip())
+
+    if not names and "role" not in item:
+        fn = item.get("function")
+        raw_name = fn.get("name") if isinstance(fn, dict) else item.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name.strip())
+
+    return names
+
+
 def extract_tool_calls(payload_or_messages: Any) -> List[Tuple[str, str, Any]]:
-    """Extract tool calls from request payload or messages list.
+    """Extract tool calls from request payload, tool list, or messages list.
 
     Returns a list of (tool_name, normalized_args_string, raw_args).
     """
@@ -482,18 +717,19 @@ def extract_tool_calls(payload_or_messages: Any) -> List[Tuple[str, str, Any]]:
             results.append((name.strip(), norm_str, raw_obj))
 
     def _process_item(item: Any):
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or _is_schema_tool_definition(item):
             return
 
+        before_len = len(results)
         tool_calls = item.get("tool_calls")
         if isinstance(tool_calls, list):
             for tc in tool_calls:
-                if isinstance(tc, dict):
+                if isinstance(tc, dict) and not _is_schema_tool_definition(tc):
                     fn = tc.get("function")
                     if isinstance(fn, dict):
                         _add(fn.get("name"), fn.get("arguments", {}))
                     else:
-                        _add(tc.get("name"), tc.get("arguments") or tc.get("input", {}))
+                        _add(tc.get("name"), tc.get("arguments") if "arguments" in tc else tc.get("input", {}))
 
         fn_call = item.get("function_call")
         if isinstance(fn_call, dict):
@@ -505,6 +741,23 @@ def extract_tool_calls(payload_or_messages: Any) -> List[Tuple[str, str, Any]]:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     _add(block.get("name"), block.get("input", {}))
 
+        tools = item.get("tools")
+        if isinstance(tools, list) and len(results) == before_len:
+            for t in tools:
+                if isinstance(t, dict) and not _is_schema_tool_definition(t):
+                    fn = t.get("function")
+                    if isinstance(fn, dict):
+                        _add(fn.get("name"), fn.get("arguments", {}))
+                    else:
+                        _add(t.get("name"), t.get("arguments") if "arguments" in t else t.get("input", {}))
+
+        if len(results) == before_len and "role" not in item:
+            fn = item.get("function")
+            if isinstance(fn, dict):
+                _add(fn.get("name"), fn.get("arguments", {}))
+            elif "name" in item:
+                _add(item.get("name"), item.get("arguments") if "arguments" in item else item.get("input", {}))
+
     if isinstance(payload_or_messages, list):
         for msg in payload_or_messages:
             _process_item(msg)
@@ -513,10 +766,165 @@ def extract_tool_calls(payload_or_messages: Any) -> List[Tuple[str, str, Any]]:
         if isinstance(messages, list):
             for msg in messages:
                 _process_item(msg)
+            if not results:
+                _process_item(payload_or_messages)
         else:
             _process_item(payload_or_messages)
 
     return results
+
+
+def _extract_active_step_tools(
+    messages: Any,
+    tool_calls: Optional[List[Any]] = None,
+) -> Tuple[List[Tuple[str, str, Any]], bool]:
+    """Extract only the active/current iteration's tool calls and whether args were explicitly supplied.
+
+    Returns:
+        (active_tools, has_explicit_args)
+    """
+    if tool_calls:
+        explicit = extract_tool_calls(tool_calls)
+        if explicit:
+            has_args = any(
+                isinstance(tc, dict)
+                and (
+                    "arguments" in tc
+                    or "input" in tc
+                    or (isinstance(tc.get("function"), dict) and "arguments" in tc["function"])
+                )
+                for tc in (tool_calls if isinstance(tool_calls, list) else [tool_calls])
+            )
+            return explicit, has_args
+
+    target = messages
+    if isinstance(target, dict):
+        top_tc = target.get("tool_calls") or target.get("tools")
+        if top_tc:
+            explicit = extract_tool_calls(top_tc)
+            if explicit:
+                has_args = any(
+                    isinstance(tc, dict)
+                    and (
+                        "arguments" in tc
+                        or "input" in tc
+                        or (isinstance(tc.get("function"), dict) and "arguments" in tc["function"])
+                    )
+                    for tc in (top_tc if isinstance(top_tc, list) else [top_tc])
+                )
+                return explicit, has_args
+        target = target.get("messages")
+
+    if isinstance(target, list) and target:
+        last = target[-1]
+        if isinstance(last, dict) and "role" not in last:
+            extracted = extract_tool_calls(target)
+            has_args = any(
+                isinstance(tc, dict)
+                and (
+                    "arguments" in tc
+                    or "input" in tc
+                    or (isinstance(tc.get("function"), dict) and "arguments" in tc["function"])
+                )
+                for tc in target
+            )
+            return extracted, has_args
+
+        idx = len(target) - 1
+        while idx >= 0:
+            msg = target[idx]
+            if not isinstance(msg, dict):
+                idx -= 1
+                continue
+            if _is_tool_result_message(msg):
+                idx -= 1
+                continue
+            extracted = extract_tool_calls([msg])
+            return extracted, bool(extracted)
+
+    return [], False
+
+
+def _compute_message_tail_streaks(
+    messages: Any,
+    mutating_set: Optional[frozenset[str]] = None,
+) -> Tuple[Optional[str], int, int]:
+    """Scan backwards from the tail of messages to compute consecutive tool name & stagnant step streaks.
+
+    Returns:
+        (tail_tool_name, consecutive_same_tool_count, consecutive_stagnant_steps)
+    """
+    target = messages.get("messages") if isinstance(messages, dict) else messages
+    if not isinstance(target, list) or not target:
+        return None, 0, 0
+
+    if isinstance(target[-1], dict) and "role" not in target[-1]:
+        names: List[str] = []
+        for item in target:
+            if isinstance(item, dict):
+                names.extend(_extract_raw_names_from_dict(item))
+        if not names:
+            return None, 0, 0
+        latest = names[-1]
+        same_cnt = 0
+        for nm in reversed(names):
+            if nm == latest:
+                same_cnt += 1
+            else:
+                break
+        stag_cnt = 0
+        for nm in reversed(names):
+            if is_mutating_tool(nm, mutating_set):
+                break
+            stag_cnt += 1
+        return latest, same_cnt, stag_cnt
+
+    tail_tool_name: Optional[str] = None
+    same_tool_count = 0
+    same_tool_active = True
+    stagnant_steps = 0
+    stagnant_active = True
+    saw_any_step = False
+
+    idx = len(target) - 1
+    while idx >= 0:
+        msg = target[idx]
+        idx -= 1
+        if not isinstance(msg, dict):
+            continue
+        if _is_tool_result_message(msg):
+            continue
+
+        turn_names = _extract_raw_names_from_dict(msg)
+        if not turn_names:
+            if not saw_any_step:
+                return None, 0, 0
+            if msg.get("role") == "assistant":
+                break
+            continue
+
+        saw_any_step = True
+        if same_tool_active:
+            for nm in reversed(turn_names):
+                if tail_tool_name is None:
+                    tail_tool_name = nm
+                    same_tool_count = 1
+                elif nm == tail_tool_name:
+                    same_tool_count += 1
+                else:
+                    same_tool_active = False
+                    break
+
+        if stagnant_active:
+            if any(is_mutating_tool(nm, mutating_set) for nm in turn_names):
+                stagnant_active = False
+            else:
+                stagnant_steps += 1
+
+        if not same_tool_active and not stagnant_active:
+            break
+
+    return tail_tool_name, same_tool_count, stagnant_steps
 
 
 DEFAULT_PRICES: Dict[str, Dict[str, float]] = {
@@ -587,6 +995,9 @@ class CircuitBreaker:
         daily_limit: float = 50.0,
         loop_threshold: int = 3,
         tool_loop_threshold: int = 3,
+        max_tool_repeats: int = 3,
+        max_stagnant_steps: int = 6,
+        mutating_tools: Optional[Iterable[str]] = None,
         loop_window_size: int = 20,
         loop_window_seconds: float = 60.0,
         prices_path: Optional[Path] = None,
@@ -597,10 +1008,18 @@ class CircuitBreaker:
         enable_context_ballooning: bool = True,
         dry_run: bool = False,
     ):
+        self._lock = threading.RLock()
         self.hourly_limit = hourly_limit
         self.daily_limit = daily_limit
         self.loop_threshold = loop_threshold
         self.tool_loop_threshold = tool_loop_threshold
+        self.max_tool_repeats = max_tool_repeats
+        self.max_stagnant_steps = max_stagnant_steps
+        self._custom_mutating_tools: Optional[frozenset[str]] = (
+            frozenset(t.strip().lower() for t in mutating_tools if isinstance(t, str) and t.strip())
+            if mutating_tools is not None
+            else None
+        )
         self.loop_window_size = loop_window_size
         self.loop_window_seconds = loop_window_seconds
         self.kill_switch_active = kill_switch
@@ -629,6 +1048,8 @@ class CircuitBreaker:
         self._tool_history: Dict[str, Deque[Tuple[float, str, str]]] = collections.defaultdict(
             lambda: collections.deque(maxlen=10)
         )
+        self._tool_repeat_state: Dict[str, Tuple[str, int, float]] = {}
+        self._stagnant_steps: Dict[str, int] = {}
         self.prices: Dict[str, Dict[str, float]] = self._load_prices()
 
     @property
@@ -771,7 +1192,6 @@ class CircuitBreaker:
         pricing = self.get_model_pricing(model)
         input_rate = pricing.get("input", 1.00)
         output_rate = pricing.get("output", 2.00)
-        # Assume input tokens cost plus minimum estimated completion tokens (50)
         return ((est_tokens * input_rate) + (50 * output_rate)) / 1_000_000.0
 
     def _prune_old_spends(self, now: float) -> None:
@@ -843,13 +1263,11 @@ class CircuitBreaker:
         now = time.time()
         self._prune_old_hashes(now)
 
-        # 1. Check global sliding window
         hashes = [h for _, h in self.recent_hashes]
         cycle = detect_cycle_in_sequence(hashes + [incoming_hash], length_1_repeats=self.loop_threshold)
         if cycle is not None:
             return cycle
 
-        # 2. Check per-session sliding window
         sess = session_id or "default"
         if sess in self._session_hashes:
             sess_hashes = [h for _, h in self._session_hashes[sess]]
@@ -953,7 +1371,241 @@ class CircuitBreaker:
     ) -> None:
         """Record an executed tool invocation into the session's rolling window."""
         canonical_args, _ = normalize_tool_arguments(arguments)
-        self._tool_history[session_id].append((time.time(), tool_name, canonical_args))
+        with self._lock:
+            self._tool_history[session_id].append((time.time(), tool_name, canonical_args))
+
+    def is_mutating_action(self, tool_name: str) -> bool:
+        """Return True if tool_name is classified as state-changing / mutating."""
+        return is_mutating_tool(tool_name, self._custom_mutating_tools)
+
+    def check_tool_retry_ceiling(
+        self,
+        session_id: str,
+        tool_name: str,
+        model: Optional[str] = None,
+        messages: Any = None,
+        min_streak: int = 1,
+    ) -> None:
+        """Check if consecutive invocations of tool_name (ignoring arguments) reach max_tool_repeats.
+
+        Non-poisoning: does not mutate session state when tripping.
+        """
+        if self.active_profile == "passive" or self.max_tool_repeats <= 0:
+            return
+        if not tool_name:
+            return
+
+        sess = session_id or "default"
+        now = time.time()
+        with self._lock:
+            prev = self._tool_repeat_state.get(sess)
+            if prev is not None:
+                last_name, count, last_ts = prev
+                if self.loop_window_seconds > 0 and (now - last_ts) > self.loop_window_seconds:
+                    sess_prospective = 1
+                elif last_name == tool_name:
+                    sess_prospective = count + 1
+                else:
+                    sess_prospective = 1
+            else:
+                sess_prospective = 1
+
+        effective_count = sess_prospective if sess_prospective >= min_streak else min_streak
+        if effective_count >= self.max_tool_repeats:
+            msg = f"ToolRetryCeilingTripped: {tool_name} called {effective_count} times consecutively"
+            if self.enable_notifications:
+                send_block_notification(
+                    title="TokenGuard Tool Retry Ceiling Alert",
+                    message=msg,
+                )
+            if model is not None or messages is not None:
+                t_saved, u_saved = self.calculate_saved_telemetry(
+                    model=model or "default",
+                    messages=messages,
+                    session_id=sess,
+                )
+            else:
+                t_saved, u_saved = None, None
+            raise ToolRetryCeilingError(
+                tool_name=tool_name,
+                repeats=effective_count,
+                message=msg,
+                tokens_saved=t_saved,
+                usd_saved=u_saved,
+            )
+
+    def record_tool_name(self, session_id: str, tool_name: str) -> None:
+        """Update per-session consecutive tool counter after pre-flight checks pass."""
+        if not tool_name:
+            return
+        sess = session_id or "default"
+        now = time.time()
+        with self._lock:
+            prev = self._tool_repeat_state.get(sess)
+            if prev is not None:
+                last_name, count, last_ts = prev
+                if self.loop_window_seconds > 0 and (now - last_ts) > self.loop_window_seconds:
+                    self._tool_repeat_state[sess] = (tool_name, 1, now)
+                elif last_name == tool_name:
+                    self._tool_repeat_state[sess] = (tool_name, count + 1, now)
+                else:
+                    self._tool_repeat_state[sess] = (tool_name, 1, now)
+            else:
+                self._tool_repeat_state[sess] = (tool_name, 1, now)
+
+    def check_stagnation(
+        self,
+        session_id: str,
+        tool_names: Optional[Sequence[str]] = None,
+        has_task_update: bool = False,
+        has_user_output: bool = False,
+        model: Optional[str] = None,
+        messages: Any = None,
+        min_steps: int = 0,
+    ) -> None:
+        """Check if session has performed >= max_stagnant_steps without state change or output milestones.
+
+        Non-poisoning: does not increment stored counter on a tripped request.
+        """
+        if self.active_profile == "passive" or self.max_stagnant_steps <= 0:
+            return
+        if has_task_update or has_user_output:
+            return
+        if not tool_names:
+            return
+        if any(self.is_mutating_action(name) for name in tool_names):
+            return
+
+        sess = session_id or "default"
+        with self._lock:
+            current_stagnant = self._stagnant_steps.get(sess, 0)
+            sess_prospective = current_stagnant + 1
+
+        effective_steps = sess_prospective if sess_prospective >= min_steps else min_steps
+        if effective_steps >= self.max_stagnant_steps:
+            msg = f"SessionStagnationTripped: {effective_steps} steps without state change"
+            if self.enable_notifications:
+                send_block_notification(
+                    title="TokenGuard Session Stagnation Alert",
+                    message=msg,
+                )
+            if model is not None or messages is not None:
+                t_saved, u_saved = self.calculate_saved_telemetry(
+                    model=model or "default",
+                    messages=messages,
+                    session_id=sess,
+                )
+            else:
+                t_saved, u_saved = None, None
+            raise SessionStagnationError(
+                steps=effective_steps,
+                message=msg,
+                tokens_saved=t_saved,
+                usd_saved=u_saved,
+            )
+
+    def record_stagnation_step(
+        self,
+        session_id: str,
+        tool_names: Optional[Sequence[str]] = None,
+        has_task_update: bool = False,
+        has_user_output: bool = False,
+    ) -> None:
+        """Update session stagnation counter after pre-flight checks succeed."""
+        sess = session_id or "default"
+        with self._lock:
+            if has_task_update or has_user_output or not tool_names:
+                self._stagnant_steps[sess] = 0
+                return
+            if any(self.is_mutating_action(name) for name in tool_names):
+                self._stagnant_steps[sess] = 0
+                return
+            self._stagnant_steps[sess] = self._stagnant_steps.get(sess, 0) + 1
+
+    def _check_session_exact_or_cycle_tool_loop(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: Any,
+        model: Optional[str] = None,
+    ) -> None:
+        """Check session tool history for exact duplicate args (length 1) or alternating cycles (length 2/3)."""
+        if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
+            return
+
+        canonical_args, _ = normalize_tool_arguments(arguments)
+        now = time.time()
+        incoming_entry = (now, tool_name, canonical_args)
+        with self._lock:
+            history = list(self._tool_history[session_id])
+        prospective = history + [incoming_entry]
+
+        if len(prospective) >= self.tool_loop_threshold:
+            tail_1 = prospective[-self.tool_loop_threshold:]
+            first = tail_1[0]
+            if all(e[1] == first[1] and e[2] == first[2] for e in tail_1[1:]):
+                elapsed = max(0.1, round(now - first[0], 1))
+                msg = f"TokenGuard intercepted repeated tool call loop: {tool_name}"
+                if self.enable_notifications:
+                    send_block_notification(
+                        title="TokenGuard Tool Loop Alert",
+                        message=f"[TOOL RETRY LOOP: HARD STOP] Tool '{tool_name}' repeated {self.tool_loop_threshold}x within {elapsed}s",
+                    )
+                t_saved, u_saved = (
+                    self.calculate_saved_telemetry(model=model, session_id=session_id)
+                    if model is not None
+                    else (None, None)
+                )
+                raise ToolPingPongError(
+                    tool_name=tool_name,
+                    message=msg,
+                    repeats=self.tool_loop_threshold,
+                    repeat_count=self.tool_loop_threshold,
+                    tool_args=canonical_args,
+                    elapsed_seconds=elapsed,
+                    cycle_length=1,
+                    pattern=[tool_name],
+                    tokens_saved=t_saved,
+                    usd_saved=u_saved,
+                )
+
+        def _cycle_match(entry_a: Tuple[float, str, str], entry_b: Tuple[float, str, str]) -> bool:
+            if entry_a[1] != entry_b[1]:
+                return False
+            if entry_a[2] == entry_b[2]:
+                return True
+            return compute_argument_similarity(entry_a[2], entry_b[2]) >= 0.90
+
+        cycle = detect_cycle_in_sequence(prospective, match_fn=_cycle_match, length_1_repeats=0)
+        if cycle is not None:
+            cycle_len = cycle["cycle_length"]
+            pattern_names = [e[1] for e in cycle["pattern"]]
+            earliest_ts = cycle["matched_items"][0][0]
+            elapsed = max(0.1, round(now - earliest_ts, 1))
+            cycle_str = " -> ".join(pattern_names)
+            if cycle_len == 2:
+                msg = f"TokenGuard intercepted alternating tool call loop (Length 2: {cycle_str})"
+            else:
+                msg = f"TokenGuard intercepted cyclical tool call loop (Length 3: {cycle_str})"
+            if self.enable_notifications:
+                send_block_notification(title="TokenGuard Tool Loop Alert", message=msg)
+            t_saved, u_saved = (
+                self.calculate_saved_telemetry(model=model, session_id=session_id)
+                if model is not None
+                else (None, None)
+            )
+            raise ToolPingPongError(
+                tool_name=tool_name,
+                message=msg,
+                repeats=2,
+                repeat_count=2,
+                tool_args=canonical_args,
+                elapsed_seconds=elapsed,
+                cycle_length=cycle_len,
+                pattern=pattern_names,
+                tokens_saved=t_saved,
+                usd_saved=u_saved,
+            )
 
     def check_message_tool_loop(
         self,
@@ -961,7 +1613,7 @@ class CircuitBreaker:
         model: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> None:
-        """Check if the messages history itself contains repeated consecutive tool calls."""
+        """Check if the messages history itself contains repeated exact tool calls or multi-tool cycles."""
         if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
             return
 
@@ -969,20 +1621,33 @@ class CircuitBreaker:
         if len(extracted) < min(self.tool_loop_threshold, 4):
             return
 
-        def _msg_tool_match(a: Tuple[str, str, Any], b: Tuple[str, str, Any]) -> bool:
-            name_a, args_a = a[0], a[1]
-            name_b, args_b = b[0], b[1]
-            if name_a != name_b:
-                return False
-            if args_a == args_b:
-                return True
-            return compute_argument_similarity(args_a, args_b) >= 0.90
+        cycle: Optional[Dict[str, Any]] = None
+        if len(extracted) >= self.tool_loop_threshold:
+            tail_1 = extracted[-self.tool_loop_threshold:]
+            first = tail_1[0]
+            if all(item[0] == first[0] and item[1] == first[1] for item in tail_1[1:]):
+                cycle = {
+                    "cycle_length": 1,
+                    "repeats": self.tool_loop_threshold,
+                    "pattern": [first],
+                    "matched_items": list(tail_1),
+                }
 
-        cycle = detect_cycle_in_sequence(
-            extracted,
-            match_fn=_msg_tool_match,
-            length_1_repeats=self.tool_loop_threshold,
-        )
+        if cycle is None:
+            def _msg_tool_match(a: Tuple[str, str, Any], b: Tuple[str, str, Any]) -> bool:
+                name_a, args_a = a[0], a[1]
+                name_b, args_b = b[0], b[1]
+                if name_a != name_b:
+                    return False
+                if args_a == args_b:
+                    return True
+                return compute_argument_similarity(args_a, args_b) >= 0.90
+
+            cycle = detect_cycle_in_sequence(
+                extracted,
+                match_fn=_msg_tool_match,
+                length_1_repeats=0,
+            )
 
         if cycle is not None:
             cycle_len = cycle["cycle_length"]
@@ -1123,7 +1788,9 @@ class CircuitBreaker:
         Raises:
             KillSwitchActiveError: If manual kill switch is enabled.
             LoopDetectedError: If the same prompt hash repeated >= threshold times consecutively.
-            ToolPingPongError: If repeated tool calls detected.
+            ToolPingPongError: If exact repeated tool calls or multi-tool cycles detected.
+            ToolRetryCeilingError: If the same tool_name is invoked >= max_tool_repeats consecutively.
+            SessionStagnationError: If >= max_stagnant_steps occur without state change.
             ContextBallooningError: If prompt tokens expand > 300% across 3 consecutive requests.
             BurnRateExceededError: If sliding window burn rate limit is exceeded.
             BudgetExceededError: If sliding hourly or daily budget limit is exceeded.
@@ -1131,107 +1798,148 @@ class CircuitBreaker:
         Returns:
             The calculated prompt_hash if allowed.
         """
-        prompt_hash = self.compute_prompt_hash(messages)
-        sess = session_id or "default"
-
-        if self.kill_switch_active:
-            t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)
-            raise KillSwitchActiveError(tokens_saved=t_saved, usd_saved=u_saved)
-
-        if self.active_profile == "passive":
-            self.record_request_hash(prompt_hash)
-            return prompt_hash
-
-        loop_cycle = self.check_loop_details(prompt_hash, session_id=sess)
-        if loop_cycle is not None:
-            cycle_len = loop_cycle.get("cycle_length", 1)
-            if cycle_len > 1:
-                msg = f"TokenGuard: infinite agent loop detected (cycle length {cycle_len})"
+        with self._lock:
+            active_tools, has_explicit_args = _extract_active_step_tools(messages, tool_calls)
+            if tool_calls and active_tools:
+                prompt_hash = self.compute_prompt_hash({"messages": messages, "tool_calls": tool_calls})
             else:
-                msg = f"TokenGuard: infinite agent loop detected ({self.loop_threshold} identical consecutive requests)"
-            if self.enable_notifications:
-                send_block_notification(
-                    title="TokenGuard Alert",
-                    message=f"Infinite loop detected & blocked for model '{model}'",
+                prompt_hash = self.compute_prompt_hash(messages)
+            sess = session_id or "default"
+
+            if self.kill_switch_active:
+                t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)
+                raise KillSwitchActiveError(tokens_saved=t_saved, usd_saved=u_saved)
+
+            if self.active_profile == "passive":
+                self.record_request_hash(prompt_hash, session_id=sess)
+                return prompt_hash
+
+            if active_tools:
+                if has_explicit_args:
+                    self.check_message_tool_loop(messages, model=model, session_id=sess)
+                    latest_tool_name, _, raw_args = active_tools[-1]
+                    self._check_session_exact_or_cycle_tool_loop(sess, latest_tool_name, raw_args, model=model)
+                else:
+                    latest_tool_name, _, raw_args = active_tools[-1]
+
+                tail_tool, tail_same_cnt, tail_stag_cnt = _compute_message_tail_streaks(
+                    messages,
+                    self._custom_mutating_tools,
                 )
-            t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)
-            raise LoopDetectedError(
-                message=msg,
-                cycle_length=cycle_len,
-                tokens_saved=t_saved,
-                usd_saved=u_saved,
-            )
+                min_same_streak = tail_same_cnt if tail_tool == latest_tool_name else 1
+                self.check_tool_retry_ceiling(
+                    sess,
+                    latest_tool_name,
+                    model=model,
+                    messages=messages,
+                    min_streak=min_same_streak,
+                )
+                step_tool_names = [t[0] for t in active_tools]
+                self.check_stagnation(
+                    sess,
+                    tool_names=step_tool_names,
+                    has_task_update=has_task_update,
+                    model=model,
+                    messages=messages,
+                    min_steps=tail_stag_cnt,
+                )
 
-        self.check_message_tool_loop(messages, model=model, session_id=sess)
-        extracted_tools = extract_tool_calls(tool_calls or messages)
-        if extracted_tools:
-            latest_tool_name, _, raw_args = extracted_tools[-1]
-            self.check_tool_loop(sess, latest_tool_name, raw_args, model=model)
-            self.record_tool_call(sess, latest_tool_name, raw_args)
-
-        est_tokens = incoming_tokens if incoming_tokens is not None else self.estimate_prompt_tokens(messages)
-
-        self.check_context_ballooning(
-            session_id=sess,
-            incoming_tokens=est_tokens,
-            has_task_update=has_task_update,
-            cache_hit=cache_hit,
-            model=model,
-        )
-
-        if self.burn_rate_limit is not None and self.burn_rate_window_seconds is not None and self.burn_rate_limit > 0:
-            window_spend, elapsed_s = self.get_burn_rate_spend(self.burn_rate_window_seconds)
-            estimated_cost = self.estimate_cost(model, messages)
-            total_projected = window_spend + estimated_cost
-            if window_spend >= self.burn_rate_limit or total_projected > self.burn_rate_limit:
-                spend_to_report = window_spend if window_spend >= self.burn_rate_limit else total_projected
-                elapsed_display = max(1, elapsed_s)
-                limit_str = self.max_burn_rate or f"${self.burn_rate_limit:.2f}/{int(self.burn_rate_window_seconds)}s"
-                msg = f"TokenGuard Circuit Breaker Tripped: Burn rate exceeded (${spend_to_report:.2f} in {elapsed_display}s). Hard limit: {limit_str}."
+            loop_cycle = self.check_loop_details(prompt_hash, session_id=sess)
+            if loop_cycle is not None:
+                cycle_len = loop_cycle.get("cycle_length", 1)
+                if cycle_len > 1:
+                    msg = f"TokenGuard: infinite agent loop detected (cycle length {cycle_len})"
+                else:
+                    msg = f"TokenGuard: infinite agent loop detected ({self.loop_threshold} identical consecutive requests)"
                 if self.enable_notifications:
                     send_block_notification(
-                        title="TokenGuard Burn Rate Alert",
-                        message=msg,
+                        title="TokenGuard Alert",
+                        message=f"Infinite loop detected & blocked for model '{model}'",
                     )
-                t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
-                raise BurnRateExceededError(
+                t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)
+                raise LoopDetectedError(
                     message=msg,
-                    current_spend=round(spend_to_report, 2),
-                    budget_limit=round(self.burn_rate_limit, 2),
+                    cycle_length=cycle_len,
                     tokens_saved=t_saved,
                     usd_saved=u_saved,
                 )
 
-        if self.hourly_limit > 0:
-            current_hourly_spend = self.get_hourly_spend()
-            estimated_cost = self.estimate_cost(model, messages)
-            if (current_hourly_spend + estimated_cost) > self.hourly_limit:
-                t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
-                raise BudgetExceededError(
-                    "TokenGuard: budget limit exceeded",
-                    tokens_saved=t_saved,
-                    usd_saved=u_saved,
-                )
+            est_tokens = incoming_tokens if incoming_tokens is not None else self.estimate_prompt_tokens(messages)
 
-        if self.daily_limit > 0:
-            current_daily_spend = self.get_daily_spend()
-            estimated_cost = self.estimate_cost(model, messages)
-            if (current_daily_spend + estimated_cost) > self.daily_limit:
-                t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
-                raise BudgetExceededError(
-                    "TokenGuard: daily budget limit exceeded",
-                    tokens_saved=t_saved,
-                    usd_saved=u_saved,
-                )
+            self.check_context_ballooning(
+                session_id=sess,
+                incoming_tokens=est_tokens,
+                has_task_update=has_task_update,
+                cache_hit=cache_hit,
+                model=model,
+            )
 
-        self.record_request_hash(prompt_hash, session_id=sess)
-        self._session_history[sess].append({
-            "prompt_tokens": est_tokens,
-            "has_task_update": has_task_update,
-            "cache_hit": cache_hit,
-            "timestamp": time.time(),
-        })
-        return prompt_hash
+            if self.burn_rate_limit is not None and self.burn_rate_window_seconds is not None and self.burn_rate_limit > 0:
+                window_spend, elapsed_s = self.get_burn_rate_spend(self.burn_rate_window_seconds)
+                estimated_cost = self.estimate_cost(model, messages)
+                total_projected = window_spend + estimated_cost
+                if window_spend >= self.burn_rate_limit or total_projected > self.burn_rate_limit:
+                    spend_to_report = window_spend if window_spend >= self.burn_rate_limit else total_projected
+                    elapsed_display = max(1, elapsed_s)
+                    limit_str = self.max_burn_rate or f"${self.burn_rate_limit:.2f}/{int(self.burn_rate_window_seconds)}s"
+                    msg = f"TokenGuard Circuit Breaker Tripped: Burn rate exceeded (${spend_to_report:.2f} in {elapsed_display}s). Hard limit: {limit_str}."
+                    if self.enable_notifications:
+                        send_block_notification(
+                            title="TokenGuard Burn Rate Alert",
+                            message=msg,
+                        )
+                    t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
+                    raise BurnRateExceededError(
+                        message=msg,
+                        current_spend=round(spend_to_report, 2),
+                        budget_limit=round(self.burn_rate_limit, 2),
+                        tokens_saved=t_saved,
+                        usd_saved=u_saved,
+                    )
+
+            if self.hourly_limit > 0:
+                current_hourly_spend = self.get_hourly_spend()
+                estimated_cost = self.estimate_cost(model, messages)
+                if (current_hourly_spend + estimated_cost) > self.hourly_limit:
+                    t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
+                    raise BudgetExceededError(
+                        "TokenGuard: budget limit exceeded",
+                        tokens_saved=t_saved,
+                        usd_saved=u_saved,
+                    )
+
+            if self.daily_limit > 0:
+                current_daily_spend = self.get_daily_spend()
+                estimated_cost = self.estimate_cost(model, messages)
+                if (current_daily_spend + estimated_cost) > self.daily_limit:
+                    t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
+                    raise BudgetExceededError(
+                        "TokenGuard: daily budget limit exceeded",
+                        tokens_saved=t_saved,
+                        usd_saved=u_saved,
+                    )
+
+            if active_tools:
+                latest_tool_name, _, raw_args = active_tools[-1]
+                self.record_tool_call(sess, latest_tool_name, raw_args)
+                for t_name, _, _ in active_tools:
+                    self.record_tool_name(sess, t_name)
+                self.record_stagnation_step(
+                    sess,
+                    tool_names=[t[0] for t in active_tools],
+                    has_task_update=has_task_update,
+                )
+            else:
+                self.record_stagnation_step(sess, tool_names=None, has_task_update=True)
+
+            self.record_request_hash(prompt_hash, session_id=sess)
+            self._session_history[sess].append({
+                "prompt_tokens": est_tokens,
+                "has_task_update": has_task_update,
+                "cache_hit": cache_hit,
+                "timestamp": time.time(),
+            })
+            return prompt_hash
 
     def record_success(
         self,
@@ -1263,20 +1971,24 @@ class CircuitBreaker:
 
     def reset(self) -> None:
         """Reset all in-memory rolling state (hash history, spend records, session tracking, tool tracking, kill switch)."""
-        self.recent_hashes.clear()
-        self._session_hashes.clear()
-        self._spend_records.clear()
-        self._session_history.clear()
-        self._tool_history.clear()
-        self.kill_switch_active = False
+        with self._lock:
+            self.recent_hashes.clear()
+            self._session_hashes.clear()
+            self._spend_records.clear()
+            self._session_history.clear()
+            self._tool_history.clear()
+            self._tool_repeat_state.clear()
+            self._stagnant_steps.clear()
+            self.kill_switch_active = False
 
     def toggle_kill_switch(self, active: Optional[bool] = None) -> bool:
         """Toggle or explicitly set the kill switch state."""
-        if active is None:
-            self.kill_switch_active = not self.kill_switch_active
-        else:
-            self.kill_switch_active = bool(active)
-        return self.kill_switch_active
+        with self._lock:
+            if active is None:
+                self.kill_switch_active = not self.kill_switch_active
+            else:
+                self.kill_switch_active = bool(active)
+            return self.kill_switch_active
 
     def update_limits(
         self,
@@ -1284,30 +1996,37 @@ class CircuitBreaker:
         daily_limit: Optional[float] = None,
         loop_threshold: Optional[int] = None,
         tool_loop_threshold: Optional[int] = None,
+        max_tool_repeats: Optional[int] = None,
+        max_stagnant_steps: Optional[int] = None,
         profile: Optional[str] = None,
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: Optional[bool] = None,
     ) -> None:
         """Dynamically update runtime limits and profile."""
-        if hourly_limit is not None and hourly_limit > 0:
-            self.hourly_limit = float(hourly_limit)
-        if daily_limit is not None and daily_limit > 0:
-            self.daily_limit = float(daily_limit)
-        if loop_threshold is not None and loop_threshold >= 0:
-            self.loop_threshold = int(loop_threshold)
-        if tool_loop_threshold is not None and tool_loop_threshold >= 0:
-            self.tool_loop_threshold = int(tool_loop_threshold)
-        if profile:
-            self.active_profile = str(profile).lower()
-        if max_burn_rate is not None:
-            self.max_burn_rate = max_burn_rate
-            parsed = parse_burn_rate(max_burn_rate)
-            if parsed:
-                self.burn_rate_limit, self.burn_rate_window_seconds = parsed
-            else:
-                self.burn_rate_limit, self.burn_rate_window_seconds = None, None
-        if enable_context_ballooning is not None:
-            self.enable_context_ballooning = bool(enable_context_ballooning)
+        with self._lock:
+            if hourly_limit is not None and hourly_limit > 0:
+                self.hourly_limit = float(hourly_limit)
+            if daily_limit is not None and daily_limit > 0:
+                self.daily_limit = float(daily_limit)
+            if loop_threshold is not None and loop_threshold >= 0:
+                self.loop_threshold = int(loop_threshold)
+            if tool_loop_threshold is not None and tool_loop_threshold >= 0:
+                self.tool_loop_threshold = int(tool_loop_threshold)
+            if max_tool_repeats is not None and max_tool_repeats >= 0:
+                self.max_tool_repeats = int(max_tool_repeats)
+            if max_stagnant_steps is not None and max_stagnant_steps >= 0:
+                self.max_stagnant_steps = int(max_stagnant_steps)
+            if profile:
+                self.active_profile = str(profile).lower()
+            if max_burn_rate is not None:
+                self.max_burn_rate = max_burn_rate
+                parsed = parse_burn_rate(max_burn_rate)
+                if parsed:
+                    self.burn_rate_limit, self.burn_rate_window_seconds = parsed
+                else:
+                    self.burn_rate_limit, self.burn_rate_window_seconds = None, None
+            if enable_context_ballooning is not None:
+                self.enable_context_ballooning = bool(enable_context_ballooning)
 
     def seed_initial_spends(self, spend_entries: List[Tuple[float, float]]) -> None:
         """Seed initial spend entries (e.g. from DB on startup) into in-memory tracker."""
@@ -1344,6 +2063,8 @@ class CircuitBreaker:
             ),
             "loop_threshold": self.loop_threshold,
             "tool_loop_threshold": self.tool_loop_threshold,
+            "max_tool_repeats": self.max_tool_repeats,
+            "max_stagnant_steps": self.max_stagnant_steps,
             "loop_window_size": self.loop_window_size,
             "recent_hashes_count": len(self.recent_hashes),
         }

@@ -1,6 +1,6 @@
 """TokenGuard: Lightweight open-source local proxy and circuit breaker for LLM calls."""
 
-from tokenguard.config import Settings, get_settings
+from tokenguard.config import Settings, TokenGuardConfig, get_settings
 from tokenguard.guard import (
     BudgetExceededError,
     BurnRateExceededError,
@@ -9,7 +9,9 @@ from tokenguard.guard import (
     ContextBallooningError,
     KillSwitchActiveError,
     LoopDetectedError,
+    SessionStagnationError,
     ToolPingPongError,
+    ToolRetryCeilingError,
 )
 from tokenguard.proxy import create_app
 from tokenguard.sdk import guard, protect
@@ -19,6 +21,7 @@ __all__ = [
     "guard",
     "protect",
     "Settings",
+    "TokenGuardConfig",
     "get_settings",
     "CircuitBreaker",
     "CircuitBreakerError",
@@ -27,6 +30,8 @@ __all__ = [
     "ContextBallooningError",
     "LoopDetectedError",
     "ToolPingPongError",
+    "ToolRetryCeilingError",
+    "SessionStagnationError",
     "KillSwitchActiveError",
     "create_app",
 ]

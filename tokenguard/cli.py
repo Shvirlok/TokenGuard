@@ -53,6 +53,17 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read integer environment variable with safe fallback."""
+    val = os.environ.get(name)
+    if val is None or not val.strip():
+        return default
+    try:
+        return int(val.strip())
+    except ValueError:
+        return default
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser with subcommands."""
     parser = argparse.ArgumentParser(
@@ -110,6 +121,18 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Maximum duplicate consecutive requests before tripping loop guard (default: 3, set 0 to disable)",
+    )
+    run_parser.add_argument(
+        "--max-tool-repeats",
+        type=int,
+        default=_env_int("TOKENGUARD_MAX_TOOL_REPEATS", 3),
+        help="Maximum consecutive calls per tool name before tripping (default: 3, set 0 to disable)",
+    )
+    run_parser.add_argument(
+        "--max-stagnant-steps",
+        type=int,
+        default=_env_int("TOKENGUARD_MAX_STAGNANT_STEPS", 6),
+        help="Maximum consecutive non-mutating steps without state change before tripping (default: 6, set 0 to disable)",
     )
     run_parser.add_argument(
         "--loop-window-seconds",
@@ -354,6 +377,18 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         help="Maximum duplicate consecutive requests before tripping loop guard (default: 3, set 0 to disable)",
     )
     p.add_argument(
+        "--max-tool-repeats",
+        type=int,
+        default=_env_int("TOKENGUARD_MAX_TOOL_REPEATS", 3),
+        help="Maximum consecutive calls per tool name before tripping (default: 3, set 0 to disable)",
+    )
+    p.add_argument(
+        "--max-stagnant-steps",
+        type=int,
+        default=_env_int("TOKENGUARD_MAX_STAGNANT_STEPS", 6),
+        help="Maximum consecutive non-mutating steps without state change before tripping (default: 6, set 0 to disable)",
+    )
+    p.add_argument(
         "--loop-window-seconds",
         type=float,
         default=60.0,
@@ -475,6 +510,8 @@ def start_daemon(
     passive: bool = False,
     max_burn_rate: Optional[str] = None,
     dry_run: bool = False,
+    max_tool_repeats: int = 3,
+    max_stagnant_steps: int = 6,
 ) -> int:
     """Spawn TokenGuard proxy in background as a daemon process."""
     existing_pid = get_daemon_pid()
@@ -498,6 +535,10 @@ def start_daemon(
         str(daily_limit),
         "--loop-threshold",
         str(loop_threshold),
+        "--max-tool-repeats",
+        str(max_tool_repeats),
+        "--max-stagnant-steps",
+        str(max_stagnant_steps),
         "--loop-window-seconds",
         str(loop_window_seconds),
         "--upstream-url",
@@ -1394,6 +1435,8 @@ def cmd_start(args: argparse.Namespace) -> None:
     limit = 1000.0 if is_passive else args.limit
     daily_limit = 5000.0 if is_passive else args.daily_limit
     loop_threshold = 0 if is_passive else args.loop_threshold
+    max_tool_repeats = 0 if is_passive else getattr(args, "max_tool_repeats", _env_int("TOKENGUARD_MAX_TOOL_REPEATS", 3))
+    max_stagnant_steps = 0 if is_passive else getattr(args, "max_stagnant_steps", _env_int("TOKENGUARD_MAX_STAGNANT_STEPS", 6))
 
     if getattr(args, "daemon", False):
         with console.status("[bright_black]Starting TokenGuard daemon in background...[/bright_black]", spinner="dots"):
@@ -1409,6 +1452,8 @@ def cmd_start(args: argparse.Namespace) -> None:
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
                 dry_run=is_dry_run,
+                max_tool_repeats=max_tool_repeats,
+                max_stagnant_steps=max_stagnant_steps,
             )
 
         if wait_for_server(args.host, args.port, timeout=5.0):
@@ -1452,6 +1497,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         daily_limit=daily_limit,
         max_burn_rate=getattr(args, "max_burn_rate", None),
         loop_threshold=loop_threshold,
+        max_tool_repeats=max_tool_repeats,
+        max_stagnant_steps=max_stagnant_steps,
         loop_window_seconds=args.loop_window_seconds,
         upstream_url=args.upstream_url,
         db_path=args.db_path,
@@ -1507,6 +1554,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     limit = 1000.0 if is_passive else getattr(args, "limit", 5.0)
     daily_limit = 5000.0 if is_passive else getattr(args, "daily_limit", 50.0)
     loop_threshold = 0 if is_passive else getattr(args, "loop_threshold", 3)
+    max_tool_repeats = 0 if is_passive else getattr(args, "max_tool_repeats", _env_int("TOKENGUARD_MAX_TOOL_REPEATS", 3))
+    max_stagnant_steps = 0 if is_passive else getattr(args, "max_stagnant_steps", _env_int("TOKENGUARD_MAX_STAGNANT_STEPS", 6))
 
     # 1. Check if TokenGuard proxy is already running; if not, auto-start daemon
     if not is_server_running(host, port):
@@ -1523,6 +1572,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
                 dry_run=is_dry_run,
+                max_tool_repeats=max_tool_repeats,
+                max_stagnant_steps=max_stagnant_steps,
             )
 
         if not is_server_running(host, port):

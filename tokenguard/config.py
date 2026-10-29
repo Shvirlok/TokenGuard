@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     max_burn_rate: Optional[str] = Field(default=None, description="Sliding window burn rate limit (e.g. $0.50/min, $2.00/5m)")
     enable_context_ballooning: bool = Field(default=True, description="Enable runaway context ballooning guard")
     dry_run: bool = Field(default=False, description="Observation mode (detect and log trips, but pass requests through upstream)")
+    max_tool_repeats: int = Field(default=3, description="Maximum consecutive calls per tool name before tripping (0 to disable)")
+    max_stagnant_steps: int = Field(default=6, description="Maximum consecutive non-mutating steps without state change before tripping (0 to disable)")
 
     def model_post_init(self, __context) -> None:
         if self.max_repeats is not None:
@@ -56,7 +58,12 @@ class Settings(BaseSettings):
         if self.passive or self.profile == "passive":
             self.profile = "passive"
             self.loop_threshold = 0
+            self.max_tool_repeats = 0
+            self.max_stagnant_steps = 0
             self.enable_context_ballooning = False
+
+
+TokenGuardConfig = Settings
 
 
 USER_CONFIG_DIR = Path.home() / ".tokenguard"

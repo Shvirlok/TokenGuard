@@ -292,6 +292,8 @@ def get_guard() -> CircuitBreaker:
             hourly_limit=settings.hourly_limit,
             daily_limit=settings.daily_limit,
             loop_threshold=settings.loop_threshold,
+            max_tool_repeats=settings.max_tool_repeats,
+            max_stagnant_steps=settings.max_stagnant_steps,
             loop_window_size=settings.loop_window_size,
             loop_window_seconds=settings.loop_window_seconds,
             prices_path=settings.prices_path,
@@ -330,6 +332,8 @@ async def lifespan(app: FastAPI):
         hourly_limit=settings.hourly_limit,
         daily_limit=settings.daily_limit,
         loop_threshold=settings.loop_threshold,
+        max_tool_repeats=settings.max_tool_repeats,
+        max_stagnant_steps=settings.max_stagnant_steps,
         loop_window_size=settings.loop_window_size,
         loop_window_seconds=settings.loop_window_seconds,
         prices_path=settings.prices_path,
@@ -787,6 +791,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         hourly_limit = payload.get("hourly_limit")
         daily_limit = payload.get("daily_limit")
         loop_threshold = payload.get("loop_threshold")
+        max_tool_repeats = payload.get("max_tool_repeats")
+        max_stagnant_steps = payload.get("max_stagnant_steps")
         profile = payload.get("profile")
         max_burn_rate = payload.get("max_burn_rate")
         enable_context_ballooning = payload.get("enable_context_ballooning")
@@ -796,6 +802,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             hourly_limit=hourly_limit,
             daily_limit=daily_limit,
             loop_threshold=loop_threshold,
+            max_tool_repeats=max_tool_repeats,
+            max_stagnant_steps=max_stagnant_steps,
             profile=profile,
             max_burn_rate=max_burn_rate,
             enable_context_ballooning=enable_context_ballooning,
@@ -1247,15 +1255,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 session_id=session_id,
                 has_task_update=has_task_update,
                 cache_hit=cache_hit,
-                tool_calls=body.get("tools"),
+                tool_calls=body.get("tool_calls") or body.get("tools"),
             )
         except CircuitBreakerError as cb_err:
+            err_code = getattr(cb_err, "code", None)
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+            if err_code == "TOOL_PING_PONG_LOOP":
                 status_tag = "blocked_tool_loop"
-            elif getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+            elif err_code == "ToolRetryCeilingTripped":
+                status_tag = "blocked_tool_retry_ceiling"
+            elif err_code == "SessionStagnationTripped":
+                status_tag = "blocked_stagnation"
+            elif err_code == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
-            elif getattr(cb_err, "code", None) == "context_ballooning_detected":
+            elif err_code == "context_ballooning_detected":
                 status_tag = "blocked_context_ballooning"
             elif cb_err.error_type == "budget_exceeded":
                 status_tag = "blocked_budget"
@@ -1307,7 +1320,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
                 }
 
-                if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+                if err_code in ("TOOL_PING_PONG_LOOP", "ToolRetryCeilingTripped", "SessionStagnationTripped"):
                     err_dict = cb_err.to_dict()
                     if "error" in err_dict and isinstance(err_dict["error"], dict):
                         err_dict["error"]["tokens_saved"] = tokens_saved
@@ -1426,15 +1439,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 session_id=session_id,
                 has_task_update=has_task_update,
                 cache_hit=cache_hit,
-                tool_calls=body.get("tool_calls"),
+                tool_calls=body.get("tool_calls") or body.get("tools"),
             )
         except CircuitBreakerError as cb_err:
+            err_code = getattr(cb_err, "code", None)
             status_tag = f"blocked_{cb_err.error_type}" if not cb_err.error_type.startswith("blocked_") else cb_err.error_type
-            if getattr(cb_err, "code", None) == "TOOL_PING_PONG_LOOP":
+            if err_code == "TOOL_PING_PONG_LOOP":
                 status_tag = "blocked_tool_loop"
-            elif getattr(cb_err, "code", None) == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
+            elif err_code == "ToolRetryCeilingTripped":
+                status_tag = "blocked_tool_retry_ceiling"
+            elif err_code == "SessionStagnationTripped":
+                status_tag = "blocked_stagnation"
+            elif err_code == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
-            elif getattr(cb_err, "code", None) == "context_ballooning_detected":
+            elif err_code == "context_ballooning_detected":
                 status_tag = "blocked_context_ballooning"
             elif cb_err.error_type == "budget_exceeded":
                 status_tag = "blocked_budget"
