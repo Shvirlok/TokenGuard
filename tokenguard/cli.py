@@ -603,14 +603,14 @@ def start_daemon(
     if max_burn_rate:
         cmd.extend(["--max-burn-rate", str(max_burn_rate)])
 
-    log_file = open(LOG_FILE, "a", encoding="utf-8")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=log_file,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     PID_FILE.write_text(str(proc.pid))
 
     if not wait_for_server(host, port, timeout=6.0):
