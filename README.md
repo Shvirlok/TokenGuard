@@ -862,10 +862,10 @@ TokenGuard maintains a built-in pricing registry (USD per 1,000,000 tokens) upda
 
 ## Automated testing and CI
 
-TokenGuard is thoroughly validated by an automated test suite of **106 tests** executed against multi-OS environments on GitHub Actions.
+TokenGuard is thoroughly validated by an automated test suite of **135 tests** executed against multi-OS environments on GitHub Actions.
 
 ```bash
-# Run complete test suite with verbose output (106 tests)
+# Run complete test suite with verbose output (135 tests)
 pytest -v
 
 # Run tests with short summary
@@ -884,7 +884,7 @@ pytest tests/test_guard.py tests/test_proxy.py tests/test_cli.py tests/test_db.p
 - **CLI & SDK**: Environment injector (`tokenguard env`), interactive TUI navigation, daemon lifecycle management, and `@protect` / `with guard():` decorators.
 
 ```bash
-# Run complete test suite (106 tests passing)
+# Run complete test suite (135 tests passing)
 pytest -v
 
 # Run tests with short summary
