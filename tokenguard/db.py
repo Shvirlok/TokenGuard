@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import datetime
+import os
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import aiosqlite
@@ -32,6 +33,20 @@ CREATE INDEX IF NOT EXISTS idx_requests_prompt_hash ON requests(prompt_hash);
 """
 
 
+def _enforce_db_permissions(db_path: Union[str, Path]) -> None:
+    """Enforce restrictive permissions (0600) on SQLite database file and WAL sidecars."""
+    p = Path(db_path)
+    if str(p) != ":memory:" and p.exists():
+        try:
+            os.chmod(p, 0o600)
+            for ext in ("-wal", "-shm"):
+                wal_p = Path(f"{p}{ext}")
+                if wal_p.exists():
+                    os.chmod(wal_p, 0o600)
+        except OSError:
+            pass
+
+
 @asynccontextmanager
 async def get_db(db_path: Union[str, Path]) -> AsyncGenerator[aiosqlite.Connection, None]:
     """Create a configured SQLite connection context with WAL mode enabled."""
@@ -40,11 +55,13 @@ async def get_db(db_path: Union[str, Path]) -> AsyncGenerator[aiosqlite.Connecti
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(str(db_path)) as db:
+        _enforce_db_permissions(db_path)
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode = WAL;")
         await db.execute("PRAGMA synchronous = NORMAL;")
         await db.execute("PRAGMA busy_timeout = 5000;")
         yield db
+        _enforce_db_permissions(db_path)
 
 
 @asynccontextmanager
@@ -52,6 +69,7 @@ async def get_readonly_db(db_path: Union[str, Path]) -> AsyncGenerator[aiosqlite
     """Create a read-only SQLite connection context in WAL mode without blocking writers."""
     db_path = Path(db_path)
     async with aiosqlite.connect(str(db_path)) as db:
+        _enforce_db_permissions(db_path)
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode = WAL;")
         await db.execute("PRAGMA query_only = ON;")
@@ -63,13 +81,13 @@ async def init_db(db_path: Union[str, Path]) -> None:
     """Initialize SQLite database tables and indexes."""
     async with get_db(db_path) as db:
         await db.executescript(SCHEMA_SQL)
-        # Migrate existing tables if session_id column was not present
         try:
             await db.execute("ALTER TABLE requests ADD COLUMN session_id TEXT;")
         except Exception:
             pass
         await db.execute("CREATE INDEX IF NOT EXISTS idx_requests_session_id ON requests(session_id);")
         await db.commit()
+    _enforce_db_permissions(db_path)
 
 
 async def log_request(
@@ -130,7 +148,6 @@ async def get_metrics(
     ).isoformat()
 
     async with get_db(db_path) as db:
-        # Metrics for the sliding window
         window_query = """
             SELECT
                 COUNT(*) AS total_requests,
@@ -153,7 +170,6 @@ async def get_metrics(
             row = await cursor.fetchone()
             window_data = dict(row) if row else {}
 
-        # All-time aggregated counters
         all_time_query = """
             SELECT
                 COUNT(*) AS all_time_total_requests,
@@ -169,8 +185,6 @@ async def get_metrics(
             all_time_row = await cursor.fetchone()
             all_time_data = dict(all_time_row) if all_time_row else {}
 
-        # Calculate estimated savings for blocked requests (e.g. blocked loops, budget overruns, kill switch)
-        # Based on the model's pricing: prompt tokens + average avoided generation of ~500 completion tokens
         blocked_rows_query = """
             SELECT model, prompt_tokens, status
             FROM requests

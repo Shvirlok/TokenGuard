@@ -17,15 +17,11 @@ export function Dashboard() {
     <div className="flex h-screen max-h-screen w-screen flex-col overflow-hidden bg-[#09090b] text-[#e4e4e7] p-2.5 gap-2 select-none font-sans">
       <h1 className="sr-only">TokenGuard — Developer Circuit Breaker HUD</h1>
 
-      {/* 1. Top Header */}
       <DashboardHeader onOpenConfig={() => setConfigOpen(true)} />
 
-      {/* 2. 3 Clean border-only KPI cards */}
       <MetricCards />
 
-      {/* 3. Main Split View: Left Traffic Stream & Right Agent Config Snippets */}
       <div className="flex-1 min-h-0 grid grid-cols-12 gap-2">
-        {/* Left Side: Traffic Stream / Logs */}
         <div className="col-span-12 lg:col-span-7 xl:col-span-8 min-h-0 h-full">
           <RequestsTable
             onInspect={setInspected}
@@ -33,13 +29,11 @@ export function Dashboard() {
           />
         </div>
 
-        {/* Right Side: Agent Config Snippets */}
         <div className="col-span-12 lg:col-span-5 xl:col-span-4 min-h-0 h-full">
           <ProtectionPanel onOpenConfig={() => setConfigOpen(true)} />
         </div>
       </div>
 
-      {/* 4. Ultra-minimal Footer */}
       <footer className="flex h-5 shrink-0 items-center justify-between px-2 font-mono text-[11px] text-zinc-500 border-t border-[#27272a]/60">
         <div>Architecture: Fail-closed local proxy • Zero-telemetry • MIT License</div>
         <div className="hidden sm:flex items-center gap-2 text-zinc-600">
@@ -49,7 +43,6 @@ export function Dashboard() {
         </div>
       </footer>
 
-      {/* Dialog Modals */}
       <ConfigDialog open={configOpen} onOpenChange={setConfigOpen} />
       <ClearLogsDialog open={clearOpen} onOpenChange={setClearOpen} />
       <InspectorDialog record={inspected} onClose={() => setInspected(null)} />

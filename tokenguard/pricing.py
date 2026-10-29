@@ -16,7 +16,7 @@ logger = logging.getLogger("tokenguard.pricing")
 DEFAULT_PRICES_PATH = Path(__file__).resolve().parent / "prices.json"
 PRICES_CACHE_DIR = Path.home() / ".tokenguard"
 PRICES_CACHE_FILE = PRICES_CACHE_DIR / "prices_cache.json"
-CACHE_TTL_SECONDS = 86400.0  # 24 hours
+CACHE_TTL_SECONDS = 86400.0
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 
@@ -30,7 +30,6 @@ def load_baseline_prices(path: Optional[Path] = None) -> Dict[str, Dict[str, flo
         except Exception as e:
             logger.warning(f"Failed to load baseline prices from {target}: {e}")
 
-    # Built-in minimal fallback if file is missing
     return {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -108,7 +107,6 @@ def fetch_openrouter_prices(timeout: float = 4.0) -> Dict[str, Dict[str, float]]
                 continue
 
             try:
-                # OpenRouter pricing is USD per token -> multiply by 1M for USD/1M tokens
                 prompt_rate = float(prompt_str or 0.0) * 1_000_000.0
                 completion_rate = float(completion_str or 0.0) * 1_000_000.0
                 if prompt_rate < 0 or completion_rate < 0:
@@ -121,14 +119,11 @@ def fetch_openrouter_prices(timeout: float = 4.0) -> Dict[str, Dict[str, float]]
                 "output": round(completion_rate, 4),
             }
 
-            # Register full ID: e.g. "openai/gpt-4o"
             prices[model_id.lower()] = rate_entry
 
-            # Register short name: e.g. "gpt-4o"
             short_id = model_id.split("/")[-1].lower()
             prices[short_id] = rate_entry
 
-            # Register alias with hyphens instead of dots (e.g. claude-3.5-sonnet -> claude-3-5-sonnet)
             if "." in short_id:
                 alt_id = short_id.replace(".", "-")
                 prices[alt_id] = rate_entry
@@ -150,14 +145,12 @@ def update_pricing_cache(
     cached, last_updated = load_cached_prices()
     now = time.time()
 
-    # Check cache freshness
     if not force and cached and (now - last_updated) < CACHE_TTL_SECONDS:
         merged = dict(baseline)
         merged.update(cached)
         age_hours = round((now - last_updated) / 3600.0, 1)
         return merged, False, f"Cache is fresh ({age_hours}h old, {len(merged)} models)"
 
-    # Fetch live rates
     try:
         live_prices = fetch_openrouter_prices(timeout=timeout)
         if live_prices:
@@ -168,7 +161,6 @@ def update_pricing_cache(
     except Exception as e:
         logger.debug(f"Dynamic price fetch failed ({e}). Falling back to existing cache or baseline.")
 
-    # Graceful fallback: return cached or baseline
     merged = dict(cached)
     merged.update(baseline)
     if cached:
@@ -191,7 +183,6 @@ def get_dynamic_pricing_table(
     merged = dict(cached)
     merged.update(baseline)
 
-    # If cache is missing or older than TTL, trigger non-blocking background refresh
     if allow_bg_update and ((now - last_updated) >= CACHE_TTL_SECONDS):
         def _bg_worker() -> None:
             try:

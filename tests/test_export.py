@@ -24,7 +24,6 @@ async def sample_db(tmp_path: Path):
     db_file = tmp_path / "test_export.db"
     await init_db(db_file)
 
-    # 1. Successful request
     await log_request(
         db_path=db_file,
         model="gpt-4o",
@@ -37,7 +36,6 @@ async def sample_db(tmp_path: Path):
         blocked_reason=None,
     )
 
-    # 2. Blocked loop request (429)
     await log_request(
         db_path=db_file,
         model="gpt-4o",
@@ -50,7 +48,6 @@ async def sample_db(tmp_path: Path):
         blocked_reason="infinite_loop_detected (3 identical consecutive requests)",
     )
 
-    # 3. Blocked budget request (429)
     await log_request(
         db_path=db_file,
         model="deepseek-chat",
@@ -105,7 +102,6 @@ async def test_format_har_export():
     assert har["log"]["creator"]["name"] == "TokenGuard"
     assert len(har["log"]["entries"]) == 2
 
-    # Verify entry 1 (success)
     e1 = har["log"]["entries"][0]
     assert e1["startedDateTime"] == "2026-10-09T12:00:00Z"
     assert e1["time"] == 120
@@ -120,7 +116,6 @@ async def test_format_har_export():
     assert e1["_completionTokens"] == 50
     assert e1["_totalTokens"] == 150
 
-    # Verify entry 2 (blocked)
     e2 = har["log"]["entries"][1]
     assert e2["response"]["status"] == 429
     assert e2["response"]["statusText"] == "Too Many Requests"
@@ -160,7 +155,6 @@ async def test_format_jsonl_export():
 @pytest.mark.asyncio
 async def test_export_telemetry_async_formats(sample_db: Path, tmp_path: Path):
     """Test exporting to JSONL and HAR files on disk."""
-    # 1. Export JSONL
     out_jsonl = tmp_path / "custom_export.jsonl"
     target, count, content = await export_telemetry_async(
         db_path=sample_db,
@@ -173,7 +167,6 @@ async def test_export_telemetry_async_formats(sample_db: Path, tmp_path: Path):
     lines = [json.loads(l) for l in out_jsonl.read_text().strip().split("\n")]
     assert len(lines) == 3
 
-    # 2. Export HAR
     out_har = tmp_path / "custom_export.har"
     target_har, count_har, content_har = await export_telemetry_async(
         db_path=sample_db,
@@ -187,7 +180,6 @@ async def test_export_telemetry_async_formats(sample_db: Path, tmp_path: Path):
     assert har_data["log"]["version"] == "1.2"
     assert len(har_data["log"]["entries"]) == 3
 
-    # 3. Export with status filter
     target_filtered, count_filtered, _ = await export_telemetry_async(
         db_path=sample_db,
         format_type="jsonl",
@@ -202,13 +194,11 @@ async def test_cli_export_subcommand(sample_db: Path, tmp_path: Path):
     """Test CLI parser and cmd_export execution."""
     parser = create_parser()
 
-    # Test parser
     args = parser.parse_args(["export", "--format", "har", "--output", str(tmp_path / "cli_test.har"), "--db-path", str(sample_db)])
     assert args.command == "export"
     assert args.format == "har"
     assert args.output == tmp_path / "cli_test.har"
 
-    # Execute cmd_export
     cmd_export(args)
     assert (tmp_path / "cli_test.har").exists()
     har_obj = json.loads((tmp_path / "cli_test.har").read_text())
@@ -223,21 +213,18 @@ async def test_proxy_api_export_endpoints(sample_db: Path):
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. JSONL Export
         res_jsonl = await client.get("/api/export?format=jsonl")
         assert res_jsonl.status_code == 200
         assert "attachment" in res_jsonl.headers.get("content-disposition", "")
         lines = [l for l in res_jsonl.text.strip().split("\n") if l]
         assert len(lines) == 3
 
-        # 2. HAR Export
         res_har = await client.get("/api/export?format=har")
         assert res_har.status_code == 200
         har_data = res_har.json()
         assert har_data["log"]["version"] == "1.2"
         assert len(har_data["log"]["entries"]) == 3
 
-        # 3. Filtered Export
         res_filtered = await client.get("/api/export?format=jsonl&status=blocked")
         assert res_filtered.status_code == 200
         lines_filtered = [l for l in res_filtered.text.strip().split("\n") if l]

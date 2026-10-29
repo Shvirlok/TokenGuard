@@ -17,13 +17,11 @@ async def test_db_init_and_logging(tmp_path: Path):
     db_file = tmp_path / "test_tokenguard.db"
     await init_db(db_file)
 
-    # Verify WAL mode is set
     async with aiosqlite.connect(db_file) as db:
         async with db.execute("PRAGMA journal_mode;") as cursor:
             row = await cursor.fetchone()
             assert row[0].lower() == "wal"
 
-    # Log requests
     req_id1 = await log_request(
         db_path=db_file,
         model="gpt-4o",
@@ -49,7 +47,6 @@ async def test_db_init_and_logging(tmp_path: Path):
     )
     assert req_id2 > req_id1
 
-    # Check metrics
     metrics = await get_metrics(db_path=db_file, time_window_hours=1.0)
     assert metrics["total_requests"] == 2
     assert metrics["success_requests"] == 1
@@ -58,10 +55,8 @@ async def test_db_init_and_logging(tmp_path: Path):
     assert pytest.approx(metrics["total_spent"], 1e-6) == 0.000875
     assert metrics["total_tokens"] == 200
     assert metrics["avg_latency_ms"] == 230.0
-    # Avoided: (150 * 2.50 + 500 * 10.00) / 1,000,000 = 0.005375 -> round 0.0054
     assert metrics["saved_cost_estimate"] == 0.0054
 
-    # Check recent requests
     recent = await get_recent_requests(db_path=db_file, limit=10)
     assert len(recent) == 2
     assert recent[0]["id"] == req_id2
@@ -69,12 +64,10 @@ async def test_db_init_and_logging(tmp_path: Path):
     assert recent[1]["id"] == req_id1
     assert recent[1]["status"] == "success"
 
-    # Check filtered requests
     blocked_only = await get_recent_requests(db_path=db_file, status_filter="blocked")
     assert len(blocked_only) == 1
     assert blocked_only[0]["status"] == "blocked_loop"
 
-    # Check hourly history
     history = await get_hourly_history(db_path=db_file, hours=24)
     assert len(history) >= 1
     assert history[0]["request_count"] == 2
@@ -88,7 +81,6 @@ async def test_saved_cost_calculation_blocked_loops(tmp_path: Path):
     db_file = tmp_path / "test_saved_cost.db"
     await init_db(db_file)
 
-    # Log 3 blocked loop requests on gpt-4o (100 prompt tokens each)
     for _ in range(3):
         await log_request(
             db_path=db_file,
@@ -100,7 +92,6 @@ async def test_saved_cost_calculation_blocked_loops(tmp_path: Path):
             blocked_reason="TokenGuard: infinite agent loop detected",
         )
 
-    # 1 blocked loop on deepseek-chat (200 prompt tokens)
     await log_request(
         db_path=db_file,
         model="deepseek-chat",
@@ -111,9 +102,6 @@ async def test_saved_cost_calculation_blocked_loops(tmp_path: Path):
         blocked_reason="TokenGuard: infinite agent loop detected",
     )
 
-    # gpt-4o: 3 * ((100 * 2.50 + 500 * 10.00) / 1,000,000) = 3 * 0.00525 = 0.01575
-    # deepseek-chat: 1 * ((200 * 0.14 + 500 * 0.28) / 1,000,000) = 0.000168
-    # Total: 0.01575 + 0.000168 = 0.015918 -> round(..., 4) = 0.0159
     metrics = await get_metrics(db_path=db_file)
     assert metrics["blocked_requests"] == 4
     assert metrics["blocked_loop_count"] == 4
@@ -129,7 +117,6 @@ async def test_db_session_id_column_and_index(tmp_path: Path):
     db_file = tmp_path / "test_session_id.db"
     await init_db(db_file)
 
-    # 1. Verify schema columns
     async with aiosqlite.connect(db_file) as db:
         async with db.execute("PRAGMA table_info(requests);") as cursor:
             cols = await cursor.fetchall()
@@ -141,13 +128,11 @@ async def test_db_session_id_column_and_index(tmp_path: Path):
             index_names = [idx[1] for idx in indices]
             assert "idx_requests_session_id" in index_names
 
-        # 2. Verify index exists
         async with db.execute("PRAGMA index_list(requests);") as cursor:
             indices = await cursor.fetchall()
             index_names = [idx[1] for idx in indices]
             assert "idx_requests_session_id" in index_names
 
-    # 3. Log with and without session_id
     id1 = await log_request(
         db_path=db_file,
         model="gpt-4o",
@@ -176,7 +161,6 @@ async def test_db_migration_adds_session_id(tmp_path: Path):
     """Verify init_db gracefully alters an existing legacy requests table lacking session_id."""
     db_file = tmp_path / "test_legacy.db"
 
-    # Create old table without session_id
     async with aiosqlite.connect(db_file) as db:
         await db.execute("""
             CREATE TABLE requests (
@@ -194,7 +178,6 @@ async def test_db_migration_adds_session_id(tmp_path: Path):
         """)
         await db.commit()
 
-    # Run init_db which includes migration
     await init_db(db_file)
 
     async with aiosqlite.connect(db_file) as db:

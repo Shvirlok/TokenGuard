@@ -27,38 +27,31 @@ def test_cli_parser_subcommands():
     """Verify parser registers all subcommands."""
     parser = create_parser()
 
-    # Test 'run' parser
     args_run = parser.parse_args(["run", "python", "script.py"])
     assert args_run.command == "run"
     assert args_run.cmd == ["python", "script.py"]
 
-    # Test 'start' parser with daemon flag and max-repeats
     args_start = parser.parse_args(["start", "-d", "--port", "9090", "--max-repeats", "5"])
     assert args_start.command == "start"
     assert args_start.daemon is True
     assert args_start.port == 9090
     assert args_start.loop_threshold == 5
 
-    # Test 'run' parser with max-repeats
     args_run_repeats = parser.parse_args(["run", "--max-repeats", "2", "python", "script.py"])
     assert args_run_repeats.loop_threshold == 2
 
-    # Test 'stop' parser
     args_stop = parser.parse_args(["stop", "--port", "8080"])
     assert args_stop.command == "stop"
 
-    # Test 'status' parser
     args_status = parser.parse_args(["status"])
     assert args_status.command == "status"
 
-    # Test 'prices' parser
     args_prices = parser.parse_args(["prices"])
     assert args_prices.command == "prices"
 
 
 def test_cmd_run_environment_injection(monkeypatch, tmp_path):
     """Verify that tokenguard run injects OPENAI_BASE_URL and OPENAI_API_BASE."""
-    # Mock is_server_running to True
     monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
 
     captured_env = {}
@@ -71,7 +64,6 @@ def test_cmd_run_environment_injection(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
 
-    # Test executing a command
     parser = create_parser()
     args = parser.parse_args(["run", "--port", "8080", "echo", "hello"])
 
@@ -111,7 +103,6 @@ def test_cmd_run_returncode_forwarding(monkeypatch):
 
 def test_cmd_run_auto_start_proxy(monkeypatch):
     """Verify that tokenguard run auto-starts proxy if not running."""
-    # First call False, second call True (after daemon starts)
     server_running_state = [False, True, True]
 
     def mock_is_server_running(host, port):
@@ -171,7 +162,6 @@ def test_daemon_stop_and_status(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(os, "kill", mock_kill)
 
-    # Test stop daemon
     success = stop_daemon(host="127.0.0.1", port=8080)
     assert success is True
     assert len(killed_pids) >= 1
@@ -195,19 +185,15 @@ def test_config_storage_and_permissions(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "USER_CONFIG_DIR", fake_config_dir)
     monkeypatch.setattr(config_mod, "USER_CONFIG_FILE", fake_config_file)
 
-    # Initial load is empty
     assert load_stored_config() == {}
 
-    # Save data
     save_stored_config({"openai_api_key": "sk-test12345678", "profile": "careful"})
     assert fake_config_file.exists()
 
-    # Verify content
     loaded = load_stored_config()
     assert loaded.get("openai_api_key") == "sk-test12345678"
     assert loaded.get("profile") == "careful"
 
-    # Verify update helper
     update_stored_config(deepseek_api_key="sk-ds98765432")
     updated = load_stored_config()
     assert updated.get("openai_api_key") == "sk-test12345678"
@@ -224,11 +210,9 @@ def test_api_key_detection_hierarchy(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "USER_CONFIG_DIR", fake_config_dir)
     monkeypatch.setattr(config_mod, "USER_CONFIG_FILE", fake_config_file)
 
-    # Clear env vars
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
 
-    # 1. Config file level
     config_mod.save_stored_config({
         "openai_api_key": "sk-from-config-1234",
         "deepseek_api_key": "sk-from-config-5678",
@@ -240,13 +224,11 @@ def test_api_key_detection_hierarchy(tmp_path, monkeypatch):
     assert get_api_key("openai") == "sk-from-config-1234"
     assert get_api_key("deepseek") == "sk-from-config-5678"
 
-    # 2. Env var takes precedence over config
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-environ-9999")
     keys2 = detect_api_keys()
     assert keys2["OPENAI_API_KEY"] == "sk-from-environ-9999"
     assert keys2["DEEPSEEK_API_KEY"] == "sk-from-config-5678"
 
-    # Test masking
     assert mask_key("sk-abcdefghijklmnop") == "sk-a••••mnop"
     assert mask_key("short") == "••••••••"
     assert mask_key("") == "None"
@@ -261,7 +243,6 @@ def test_cmd_quickstart_already_running(monkeypatch):
 
     parser = create_parser()
     args = parser.parse_args([])
-    # Should complete without error
     cmd_quickstart(args)
 
 
@@ -289,7 +270,7 @@ def test_cmd_quickstart_new_launch(monkeypatch):
     cmd_quickstart(args)
 
     assert started_args.get("port") == 8080
-    assert started_args.get("limit") == 5.0  # Default Careful profile
+    assert started_args.get("limit") == 5.0
     assert started_args.get("loop_threshold") == 2
 
 
@@ -313,7 +294,6 @@ def test_cli_reactive_control_commands(monkeypatch):
     """Verify CLI kill, resume, profile, and clear commands."""
     from tokenguard.cli import cmd_kill, cmd_resume, cmd_profile, cmd_clear, cmd_logs
 
-    # 1. Test parser recognizes all new subcommands
     parser = create_parser()
     assert parser.parse_args(["kill"]).command == "kill"
     assert parser.parse_args(["resume"]).command == "resume"
@@ -322,7 +302,6 @@ def test_cli_reactive_control_commands(monkeypatch):
     assert parser.parse_args(["logs", "-f"]).command == "logs"
     assert parser.parse_args(["tail"]).command == "tail"
 
-    # Mock server running
     monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
 
     http_calls = []
@@ -363,27 +342,22 @@ def test_cli_reactive_control_commands(monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", MockHttpxClient)
 
-    # 2. Test Kill Command
     args_kill = parser.parse_args(["kill"])
     cmd_kill(args_kill)
     assert any(c[0] == "POST" and "/api/kill-switch" in c[1] and c[2].get("active") is True for c in http_calls)
 
-    # 3. Test Resume Command
     args_resume = parser.parse_args(["resume"])
     cmd_resume(args_resume)
     assert any(c[0] == "POST" and "/api/kill-switch" in c[1] and c[2].get("active") is False for c in http_calls)
 
-    # 4. Test Profile Command
     args_prof = parser.parse_args(["profile", "standard"])
     cmd_profile(args_prof)
     assert any(c[0] == "POST" and "/api/config" in c[1] and c[2].get("profile") == "standard" for c in http_calls)
 
-    # 5. Test Clear Command
     args_clear = parser.parse_args(["clear"])
     cmd_clear(args_clear)
     assert any(c[0] == "POST" and "/api/clear-logs" in c[1] for c in http_calls)
 
-    # 6. Test Logs Snapshot Command
     args_logs = parser.parse_args(["logs", "-n", "10"])
     cmd_logs(args_logs)
     assert any(c[0] == "GET" and "/api/requests" in c[1] for c in http_calls)
@@ -401,21 +375,18 @@ def test_interactive_select_navigation(monkeypatch):
 
     original_read_raw = cli_module._read_raw_key
 
-    # 1. Non-interactive fallback
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     res = interactive_select(options, default_index=0)
     assert res == "opt1"
     res2 = interactive_select(options, default_index=2)
     assert res2 == "opt3"
 
-    # 2. Number key press (direct select)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdin, "fileno", lambda: 0)
     monkeypatch.setattr(cli_module, "_read_raw_key", lambda fd: "2")
     res_num = interactive_select(options, default_index=0)
     assert res_num == "opt2"
 
-    # 3. Arrow Down + Enter
     keys_seq = ["down", "enter"]
     def mock_read_key_arrow(fd):
         if keys_seq:
@@ -426,7 +397,6 @@ def test_interactive_select_navigation(monkeypatch):
     res_arrow = interactive_select(options, default_index=0)
     assert res_arrow == "opt2"
 
-    # 4. Arrow Up + Enter (wrap to last item)
     keys_seq_up = ["up", "enter"]
     def mock_read_key_up(fd):
         if keys_seq_up:
@@ -437,7 +407,6 @@ def test_interactive_select_navigation(monkeypatch):
     res_wrap = interactive_select(options, default_index=0)
     assert res_wrap == "opt3"
 
-    # 5. Direct test of _read_raw_key with byte escape sequences
     fake_reads = [b'\x1b[B', b'\x1b[A', b'\x1bOB', b'1', b'\r']
     def mock_os_read(fd, n):
         if fake_reads:
@@ -465,15 +434,12 @@ def test_cli_passive_flag(monkeypatch):
     """Verify that --passive is correctly accepted and passed to daemon/settings."""
     parser = create_parser()
 
-    # Test start with --passive
     args_start = parser.parse_args(["start", "--passive"])
     assert args_start.passive is True
 
-    # Test run with --passive
     args_run = parser.parse_args(["run", "--passive", "python", "script.py"])
     assert args_run.passive is True
 
-    # Test start_daemon receives passive flag
     spawned_cmds = []
     def mock_popen(cmd, *args, **kwargs):
         spawned_cmds.append(cmd)
@@ -494,11 +460,9 @@ def test_cli_max_burn_rate_flag(monkeypatch):
     """Verify that --max-burn-rate is parsed and passed to start_daemon."""
     parser = create_parser()
 
-    # Test start with --max-burn-rate
     args_start = parser.parse_args(["start", "--max-burn-rate", "$0.50/min"])
     assert args_start.max_burn_rate == "$0.50/min"
 
-    # Test run with --max-burn-rate
     args_run = parser.parse_args(["run", "--max-burn-rate", "$2.00/5m", "python", "script.py"])
     assert args_run.max_burn_rate == "$2.00/5m"
 
@@ -612,15 +576,12 @@ def test_cli_dry_run_flags(monkeypatch):
     """Verify --dry-run flag parsing on start and run subcommands, and daemon invocation."""
     parser = create_parser()
 
-    # Test start with --dry-run
     args_start = parser.parse_args(["start", "--dry-run"])
     assert args_start.dry_run is True
 
-    # Test run with --dry-run
     args_run = parser.parse_args(["run", "--dry-run", "python", "test_agent.py"])
     assert args_run.dry_run is True
 
-    # Test start_daemon forwards --dry-run
     spawned_cmds = []
     def mock_popen(cmd, *args, **kwargs):
         spawned_cmds.append(cmd)
@@ -635,9 +596,5 @@ def test_cli_dry_run_flags(monkeypatch):
     pid = start_daemon(port=8080, dry_run=True)
     assert pid == 77777
     assert "--dry-run" in spawned_cmds[0]
-
-
-
-
 
 

@@ -19,6 +19,7 @@ def sdk_test_app(tmp_path: Path):
         loop_threshold=3,
         loop_window_seconds=60.0,
         db_path=db_file,
+        admin_token_required=False,
     )
     set_settings(settings)
     app = create_app(settings)
@@ -26,7 +27,6 @@ def sdk_test_app(tmp_path: Path):
 
 
 def test_sdk_behavior(sdk_test_app, monkeypatch):
-    # Mock upstream OpenAI response
     mock_resp = {
         "id": "chatcmpl-sdk-test",
         "object": "chat.completion",
@@ -45,11 +45,9 @@ def test_sdk_behavior(sdk_test_app, monkeypatch):
     with TestClient(sdk_test_app) as client:
         monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
 
-        # 1. Reset guard
         reset_res = client.post("/api/reset")
         assert reset_res.status_code == 200
 
-        # 2. Call prompt A twice
         payload_a = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Prompt A"}]}
         r1 = client.post("/v1/chat/completions", json=payload_a)
         assert r1.status_code == 200
@@ -57,12 +55,10 @@ def test_sdk_behavior(sdk_test_app, monkeypatch):
         r2 = client.post("/v1/chat/completions", json=payload_a)
         assert r2.status_code == 200
 
-        # 3. 3rd time prompt A trips
         r3 = client.post("/v1/chat/completions", json=payload_a)
         assert r3.status_code == 429
         assert r3.json()["error"]["type"] == "loop_detected"
 
-        # 4. Prompt B immediately succeeds without 429!
         payload_b = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Prompt B"}]}
         r_b = client.post("/v1/chat/completions", json=payload_b)
         assert r_b.status_code == 200

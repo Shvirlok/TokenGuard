@@ -100,7 +100,6 @@ class guard:
             "OPENROUTER_BASE_URL": proxy_url,
         }
 
-        # Backup existing values
         for key in target_mapping:
             self._saved_env[key] = os.environ.get(key)
             os.environ[key] = target_mapping[key]
@@ -190,7 +189,7 @@ def protect(
                 ):
                     return await target_fn(*args, **kwargs)
 
-            return async_wrapped  # type: ignore[return-value]
+            return async_wrapped
         else:
             @functools.wraps(target_fn)
             def sync_wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -204,7 +203,7 @@ def protect(
                 ):
                     return target_fn(*args, **kwargs)
 
-            return sync_wrapped  # type: ignore[return-value]
+            return sync_wrapped
 
     if func is not None and callable(func):
         return decorator(func)

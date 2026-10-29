@@ -100,7 +100,6 @@
   }
 }
 
-/* Custom sleek scrollbar for CLI/terminal HUD */
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;

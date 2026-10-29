@@ -12,7 +12,6 @@ export async function detectProxy(): Promise<string | null> {
       const data = await res.json()
       if (data?.service === 'TokenGuard') return base
     } catch {
-      // Proxy not reachable at this address; try the next candidate.
     }
   }
   return null

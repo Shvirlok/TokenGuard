@@ -430,6 +430,105 @@ class KillSwitchActiveError(CircuitBreakerError):
         )
 
 
+class SecretLeakError(CircuitBreakerError):
+    """Tripped when an outgoing request contains raw secrets (API keys, private keys)."""
+
+    def __init__(
+        self,
+        pattern_type: str,
+        message: Optional[str] = None,
+        tokens_saved: Optional[int] = None,
+        usd_saved: Optional[float] = None,
+    ):
+        msg = message or f"SecretLeakDetected: Found matching pattern {pattern_type}"
+        super().__init__(
+            message=msg,
+            error_type="secret_leak_detected",
+            status_code=400,
+            code="SecretLeakDetected",
+            pattern_type=pattern_type,
+            tokens_saved=tokens_saved,
+            usd_saved=usd_saved,
+        )
+        self.pattern_type = pattern_type
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "type": "secret_leak_detected",
+            "code": "SecretLeakDetected",
+            "message": self.message,
+            "pattern_type": self.pattern_type,
+        }
+        if self.tokens_saved is not None:
+            data["tokens_saved"] = self.tokens_saved
+        if self.usd_saved is not None:
+            data["usd_saved"] = self.usd_saved
+        return {"error": data}
+
+
+SECRET_PATTERNS: List[Tuple[str, str]] = [
+    ("pem_private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    ("openai_proj_key", r"sk-proj-[a-zA-Z0-9_\-]{20,}"),
+    ("openai_key", r"sk-[a-zA-Z0-9]{20,}"),
+    ("anthropic_key", r"sk-ant-[a-zA-Z0-9_\-]{20,}"),
+    ("aws_access_key", r"AKIA[0-9A-Z]{16}"),
+    ("github_pat", r"github_pat_[a-zA-Z0-9_]{82}"),
+    ("github_token", r"ghp_[a-zA-Z0-9]{36}"),
+]
+
+COMBINED_SECRET_RE = re.compile("|".join(f"(?P<{name}>{pat})" for name, pat in SECRET_PATTERNS))
+
+
+def scan_secrets_in_obj(obj: Any) -> Optional[str]:
+    """Recursively search for secrets in objects (strings, dicts, lists).
+    
+    Returns pattern group name (e.g. 'openai_proj_key', 'anthropic_key') or None.
+    """
+    if isinstance(obj, str):
+        m = COMBINED_SECRET_RE.search(obj)
+        if m:
+            return m.lastgroup
+        return None
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            found = scan_secrets_in_obj(v)
+            if found:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found = scan_secrets_in_obj(item)
+            if found:
+                return found
+    return None
+
+
+def redact_secrets_in_obj(obj: Any) -> Tuple[Any, bool]:
+    """Recursively replace matching secrets with '***REDACTED_SECRET***' in objects."""
+    if isinstance(obj, str):
+        if COMBINED_SECRET_RE.search(obj):
+            return COMBINED_SECRET_RE.sub("***REDACTED_SECRET***", obj), True
+        return obj, False
+    elif isinstance(obj, dict):
+        new_dict = {}
+        any_redacted = False
+        for k, v in obj.items():
+            new_v, redacted = redact_secrets_in_obj(v)
+            new_dict[k] = new_v
+            if redacted:
+                any_redacted = True
+        return new_dict, any_redacted
+    elif isinstance(obj, list):
+        new_list = []
+        any_redacted = False
+        for item in obj:
+            new_item, redacted = redact_secrets_in_obj(item)
+            new_list.append(new_item)
+            if redacted:
+                any_redacted = True
+        return new_list, any_redacted
+    return obj, False
+
+
 DYNAMIC_NONCE_KEYS: frozenset[str] = frozenset({
     "call_id",
     "timestamp",
@@ -1007,6 +1106,8 @@ class CircuitBreaker:
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: bool = True,
         dry_run: bool = False,
+        block_secrets: bool = False,
+        redact_secrets: bool = False,
     ):
         self._lock = threading.RLock()
         self.hourly_limit = hourly_limit
@@ -1029,6 +1130,8 @@ class CircuitBreaker:
         self.max_burn_rate = max_burn_rate
         self.enable_context_ballooning = enable_context_ballooning
         self.dry_run = dry_run
+        self.block_secrets = block_secrets
+        self.redact_secrets = redact_secrets
 
         self.burn_rate_limit: Optional[float] = None
         self.burn_rate_window_seconds: Optional[float] = None
@@ -1294,6 +1397,16 @@ class CircuitBreaker:
         if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
             return
 
+        if self.block_secrets:
+            secret_match = scan_secrets_in_obj(arguments)
+            if secret_match:
+                t_saved, u_saved = self.calculate_saved_telemetry(model, session_id=session_id) if model else (None, None)
+                raise SecretLeakError(
+                    pattern_type=secret_match,
+                    tokens_saved=t_saved,
+                    usd_saved=u_saved,
+                )
+
         canonical_args, _ = normalize_tool_arguments(arguments)
         now = time.time()
         incoming_entry = (now, tool_name, canonical_args)
@@ -1532,6 +1645,16 @@ class CircuitBreaker:
         """Check session tool history for exact duplicate args (length 1) or alternating cycles (length 2/3)."""
         if self.active_profile == "passive" or self.tool_loop_threshold <= 1:
             return
+
+        if self.block_secrets:
+            secret_match = scan_secrets_in_obj(arguments)
+            if secret_match:
+                t_saved, u_saved = self.calculate_saved_telemetry(model, session_id=session_id) if model else (None, None)
+                raise SecretLeakError(
+                    pattern_type=secret_match,
+                    tokens_saved=t_saved,
+                    usd_saved=u_saved,
+                )
 
         canonical_args, _ = normalize_tool_arguments(arguments)
         now = time.time()
@@ -1805,6 +1928,18 @@ class CircuitBreaker:
             else:
                 prompt_hash = self.compute_prompt_hash(messages)
             sess = session_id or "default"
+
+            if self.block_secrets:
+                secret_match = scan_secrets_in_obj(messages)
+                if not secret_match and tool_calls:
+                    secret_match = scan_secrets_in_obj(tool_calls)
+                if secret_match:
+                    t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)
+                    raise SecretLeakError(
+                        pattern_type=secret_match,
+                        tokens_saved=t_saved,
+                        usd_saved=u_saved,
+                    )
 
             if self.kill_switch_active:
                 t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess)

@@ -13,14 +13,12 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
   const { stats, mode, baseUrl, pending, toggleKillSwitch, soundEnabled, setSoundEnabled } = useTokenGuard()
   const killed = Boolean(stats?.kill_switch_active)
 
-  // Determine socket address
   const socketAddress = baseUrl
     ? baseUrl.replace(/^https?:\/\//, '')
     : '127.0.0.1:8080'
 
   return (
     <header className="flex h-11 shrink-0 items-center justify-between border-b border-[#27272a] bg-[#101012] px-3 font-mono">
-      {/* Left: App Title, Version, Social Proof Badge */}
       <div className="flex items-center gap-2.5">
         <div className="flex items-center gap-1.5">
           <div className="flex size-5 items-center justify-center rounded bg-[#18181b] border border-[#27272a] text-zinc-300">
@@ -34,7 +32,6 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
 
         <div className="h-3.5 w-px bg-[#27272a]" />
 
-        {/* Social Proof Badge */}
         <a
           href="https://github.com/xerj-org/xerj"
           target="_blank"
@@ -47,9 +44,7 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
         </a>
       </div>
 
-      {/* Right: Socket Indicator + Hardware Kill Switch */}
       <div className="flex items-center gap-3">
-        {/* Proxy Socket Indicator */}
         <div className="flex items-center gap-2 text-[11px]">
           <span
             className={cn(
@@ -69,7 +64,6 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
 
         <div className="h-3.5 w-px bg-[#27272a]" />
 
-        {/* Hardware-style KILL SWITCH button */}
         <button
           type="button"
           onClick={toggleKillSwitch}
@@ -85,7 +79,6 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
           <span>{killed ? 'KILL SWITCH: ENGAGED' : 'KILL SWITCH'}</span>
         </button>
 
-        {/* Quick controls */}
         <div className="flex items-center gap-1">
           {onOpenConfig && (
             <Tooltip>

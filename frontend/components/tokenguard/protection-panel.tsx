@@ -40,7 +40,6 @@ tokenguard run python my_agent.py`,
     label: 'TypeScript',
     code: `import OpenAI from "openai";
 
-// Route agent traffic through TokenGuard circuit breaker
 const client = new OpenAI({
   baseURL: "http://127.0.0.1:8080/v1",
 });
@@ -65,7 +64,6 @@ export function ProtectionPanel({ onOpenConfig }: ProtectionPanelProps) {
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
     } catch {
-      // fallback
     }
   }
 
@@ -74,14 +72,12 @@ export function ProtectionPanel({ onOpenConfig }: ProtectionPanelProps) {
       aria-label="Agent Config Snippets & Policy"
       className="flex h-full min-h-0 flex-col rounded border border-[#27272a] bg-[#101012] font-mono text-xs"
     >
-      {/* Header & Tabs */}
       <div className="flex shrink-0 items-center justify-between border-b border-[#27272a] px-3 py-2">
         <div className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-zinc-200">
           <span className="size-2 rounded-full bg-[#10b981]" />
           <span>Agent Config Snippets</span>
         </div>
 
-        {/* 1-Click Copy Button */}
         <button
           type="button"
           onClick={handleCopy}
@@ -92,7 +88,6 @@ export function ProtectionPanel({ onOpenConfig }: ProtectionPanelProps) {
         </button>
       </div>
 
-      {/* Language Tab Selector */}
       <div className="flex shrink-0 border-b border-[#27272a] bg-[#141416] px-2 text-[11px]">
         {(['python', 'bash', 'typescript'] as TabType[]).map((tab) => (
           <button
@@ -111,14 +106,12 @@ export function ProtectionPanel({ onOpenConfig }: ProtectionPanelProps) {
         ))}
       </div>
 
-      {/* Code Snippet Box */}
       <div className="flex-1 min-h-0 overflow-y-auto bg-[#09090b] p-3 text-zinc-300">
         <pre className="text-[11px] leading-relaxed font-mono whitespace-pre select-text">
           <code>{activeSnippet.code}</code>
         </pre>
       </div>
 
-      {/* Guard Policy HUD Bar */}
       <div className="shrink-0 border-t border-[#27272a] bg-[#101012] p-2.5">
         <div className="mb-2 flex items-center justify-between text-[10px] uppercase text-zinc-400">
           <span className="flex items-center gap-1">

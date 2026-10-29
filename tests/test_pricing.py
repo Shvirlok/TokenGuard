@@ -66,19 +66,16 @@ def test_fetch_openrouter_prices_parsing(monkeypatch):
     with patch("httpx.Client.get", return_value=mock_resp):
         prices = fetch_openrouter_prices(timeout=2.0)
 
-    # Verify openai/gpt-4o-2024-11-20
     assert "openai/gpt-4o-2024-11-20" in prices
     assert "gpt-4o-2024-11-20" in prices
     assert prices["gpt-4o-2024-11-20"]["input"] == 2.50
     assert prices["gpt-4o-2024-11-20"]["output"] == 10.00
 
-    # Verify claude-3.5-sonnet and alias claude-3-5-sonnet
     assert "claude-3.5-sonnet" in prices
     assert "claude-3-5-sonnet" in prices
     assert prices["claude-3-5-sonnet"]["input"] == 3.00
     assert prices["claude-3-5-sonnet"]["output"] == 15.00
 
-    # Verify negative rates are ignored
     assert "invalid/negative-model" not in prices
 
 
@@ -88,7 +85,6 @@ def test_update_pricing_cache_ttl(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("tokenguard.pricing.PRICES_CACHE_DIR", tmp_path)
     monkeypatch.setattr("tokenguard.pricing.PRICES_CACHE_FILE", cache_file)
 
-    # 1. Mock live fetch
     mock_live = {
         "gpt-5-preview": {"input": 5.0, "output": 20.0},
     }
@@ -100,7 +96,6 @@ def test_update_pricing_cache_ttl(tmp_path: Path, monkeypatch):
     assert "gpt-4o" in merged
     assert cache_file.exists()
 
-    # 2. Re-run without force -> should be fresh
     merged2, was_updated2, msg2 = update_pricing_cache(force=False)
     assert was_updated2 is False
     assert "Cache is fresh" in msg2
@@ -135,7 +130,6 @@ def test_cli_prices_flags():
     args_offline = parser.parse_args(["prices", "--offline"])
     assert args_offline.offline is True
 
-    # Test cmd_prices execution with offline flag
     cmd_prices(args_offline)
 
 

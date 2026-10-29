@@ -9,7 +9,6 @@ from tokenguard.sdk import guard, protect
 
 def test_guard_context_manager_sync():
     """Verify with guard(): sets proxy environment variables and restores them cleanly."""
-    # Ensure starting from known state
     os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
     os.environ.pop("ANTHROPIC_BASE_URL", None)
 
@@ -22,7 +21,6 @@ def test_guard_context_manager_sync():
         assert os.environ["MISTRAL_API_BASE"] == "http://127.0.0.1:8080/v1"
         assert os.environ["OPENROUTER_BASE_URL"] == "http://127.0.0.1:8080/v1"
 
-    # Verify restoration
     assert os.environ["OPENAI_BASE_URL"] == "https://api.openai.com/v1"
     assert "ANTHROPIC_BASE_URL" not in os.environ
 
@@ -54,7 +52,6 @@ def test_protect_decorator_sync():
     """Verify @protect on sync functions with and without arguments."""
     os.environ.pop("OPENAI_BASE_URL", None)
 
-    # 1. Bare decorator @protect
     @protect(auto_start=False)
     def my_sync_task(a: int, b: int) -> int:
         assert os.environ["OPENAI_BASE_URL"] == "http://127.0.0.1:8080/v1"
@@ -64,7 +61,6 @@ def test_protect_decorator_sync():
     assert result == 30
     assert "OPENAI_BASE_URL" not in os.environ
 
-    # 2. Parameterized decorator @protect(...)
     @protect(max_repeats=2, budget_limit=15.0, port=8888, auto_start=False)
     def my_custom_task(msg: str) -> str:
         assert os.environ["OPENAI_BASE_URL"] == "http://127.0.0.1:8888/v1"

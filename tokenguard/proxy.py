@@ -1,4 +1,3 @@
-"""FastAPI proxy application for TokenGuard."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
@@ -16,7 +16,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from tokenguard.config import Settings, get_api_key, get_settings
+from tokenguard.config import (
+    Settings,
+    get_admin_token,
+    get_api_key,
+    get_or_create_admin_token,
+    get_settings,
+)
 from tokenguard.db import (
     clear_all_requests,
     get_all_requests_for_export,
@@ -41,21 +47,17 @@ from tokenguard.guard import (
     ContextBallooningError,
     KillSwitchActiveError,
     LoopDetectedError,
+    SecretLeakError,
     ToolPingPongError,
     parse_burn_rate,
+    redact_secrets_in_obj,
+    scan_secrets_in_obj,
 )
 
 logger = logging.getLogger("tokenguard.proxy")
 
 
 class StreamAccumulator:
-    """Lightweight background character/token accumulator for SSE streams.
-
-    Processes SSE chunks asynchronously in a background task without blocking
-    the pass-through streaming loop. Extracts native provider usage blocks
-    if available (OpenAI stream_options include_usage, Anthropic message_start/message_delta),
-    or accumulates characters and estimates tokens if native usage is omitted.
-    """
 
     def __init__(self, is_anthropic: bool = False, prompt_tokens_estimate: int = 0):
         self.is_anthropic = is_anthropic
@@ -196,7 +198,6 @@ def _detect_task_update(
     body: Dict[str, Any],
     messages: Any,
 ) -> bool:
-    """Detect if request contains an explicit task status update."""
     for h in ("x-task-status", "x-status-update", "x-task-state", "x-task-complete"):
         if h in headers and headers[h]:
             return True
@@ -233,7 +234,6 @@ def _detect_cache_hit(
     headers: Dict[str, str],
     body: Dict[str, Any],
 ) -> bool:
-    """Detect if request is marked as a prompt cache hit."""
     for h in ("x-cache-hit", "x-prompt-cache-hit", "x-cache"):
         val = str(headers.get(h, "")).lower()
         if val in ("true", "1", "hit"):
@@ -248,8 +248,6 @@ def _detect_cache_hit(
 
 
 class EventBroadcaster:
-    """Manages Server-Sent Events (SSE) subscriptions and real-time broadcasting."""
-
     def __init__(self):
         self._subscribers: Set[asyncio.Queue] = set()
 
@@ -277,14 +275,12 @@ class EventBroadcaster:
                 pass
 
 
-# Global state instances
 broadcaster = EventBroadcaster()
 circuit_breaker: Optional[CircuitBreaker] = None
 http_client: Optional[httpx.AsyncClient] = None
 
 
 def get_guard() -> CircuitBreaker:
-    """Return active CircuitBreaker instance, initializing a default if not yet created."""
     global circuit_breaker
     if circuit_breaker is None:
         settings = get_settings()
@@ -302,12 +298,13 @@ def get_guard() -> CircuitBreaker:
             max_burn_rate=settings.max_burn_rate,
             enable_context_ballooning=settings.enable_context_ballooning,
             dry_run=settings.dry_run,
+            block_secrets=settings.block_secrets,
+            redact_secrets=settings.redact_secrets,
         )
     return circuit_breaker
 
 
 def get_client() -> httpx.AsyncClient:
-    """Return active httpx.AsyncClient instance."""
     global http_client
     if http_client is None:
         settings = get_settings()
@@ -320,14 +317,15 @@ def get_client() -> httpx.AsyncClient:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager for setup and teardown."""
     global circuit_breaker, http_client
     settings = get_settings()
 
-    # Initialize SQLite database
+    get_or_create_admin_token()
+
+    get_or_create_admin_token()
+
     await init_db(settings.db_path)
 
-    # Initialize CircuitBreaker engine with burn rate and context ballooning guard
     circuit_breaker = CircuitBreaker(
         hourly_limit=settings.hourly_limit,
         daily_limit=settings.daily_limit,
@@ -342,13 +340,13 @@ async def lifespan(app: FastAPI):
         max_burn_rate=settings.max_burn_rate,
         enable_context_ballooning=settings.enable_context_ballooning,
         dry_run=settings.dry_run,
+        block_secrets=settings.block_secrets,
+        redact_secrets=settings.redact_secrets,
     )
 
-    # Seed recent spends from SQLite to back sliding window burn-rate engine
     recent_spends = await get_recent_spends(settings.db_path, hours=24.0)
     circuit_breaker.seed_initial_spends(recent_spends)
 
-    # Persistent HTTP client for upstream proxying
     http_client = httpx.AsyncClient(
         base_url=settings.upstream_url,
         timeout=httpx.Timeout(settings.timeout, connect=10.0),
@@ -357,7 +355,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Teardown
     if http_client is not None:
         await http_client.aclose()
 
@@ -374,7 +371,6 @@ async def _record_and_broadcast_request(
     blocked_reason: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> int:
-    """Log an LLM request to SQLite and broadcast a real-time event to all SSE clients."""
     rec_id = await log_request(
         db_path=db_path,
         model=model,
@@ -406,7 +402,6 @@ async def _record_and_broadcast_request(
 
 
 def detect_provider(model: str) -> str:
-    """Detect upstream provider from model identifier."""
     m = (model or "").lower().strip()
     if m.startswith("openrouter/") or "openrouter" in m:
         return "openrouter"
@@ -425,13 +420,51 @@ def detect_provider(model: str) -> str:
     return "openai"
 
 
+def is_self_referential_url(url: str, current_port: int, current_host: str = "127.0.0.1") -> bool:
+    """Check if target host and port point back to TokenGuard listening socket."""
+    if not url:
+        return False
+    u = url.strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "http://" + u
+    try:
+        parsed = urlparse(u)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self_hosts = {"127.0.0.1", "localhost", "0.0.0.0", current_host.lower()}
+        if hostname in self_hosts and port == current_port:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_self_referential_url(url: str, current_port: int, current_host: str = "127.0.0.1") -> bool:
+    if not url:
+        return False
+    u = url.strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "http://" + u
+    try:
+        parsed = urlparse(u)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self_hosts = {"127.0.0.1", "localhost", "0.0.0.0", current_host.lower()}
+        if hostname in self_hosts and port == current_port:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_upstream_url(provider: str, endpoint: str = "chat/completions") -> str:
-    """Resolve destination URL for a given provider and endpoint."""
     settings = get_settings()
     p = provider.lower().strip()
 
     if p == "anthropic":
         base = os.environ.get("ANTHROPIC_BASE_URL", settings.anthropic_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://api.anthropic.com"
         if endpoint == "messages":
             if base.endswith("/v1/messages") or base.endswith("/messages"):
                 return base
@@ -447,18 +480,24 @@ def resolve_upstream_url(provider: str, endpoint: str = "chat/completions") -> s
 
     elif p == "gemini":
         base = os.environ.get("GEMINI_BASE_URL", os.environ.get("GOOGLE_BASE_URL", settings.gemini_url)).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://generativelanguage.googleapis.com/v1beta/openai"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         return f"{base}/chat/completions"
 
     elif p in ("dashscope", "qwen", "qwq"):
         base = os.environ.get("DASHSCOPE_BASE_URL", os.environ.get("QWEN_BASE_URL", settings.dashscope_url)).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         return f"{base}/chat/completions"
 
     elif p == "deepseek":
         base = os.environ.get("DEEPSEEK_BASE_URL", settings.deepseek_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://api.deepseek.com"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         elif base.endswith("/v1"):
@@ -467,24 +506,32 @@ def resolve_upstream_url(provider: str, endpoint: str = "chat/completions") -> s
 
     elif p == "groq":
         base = os.environ.get("GROQ_BASE_URL", settings.groq_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://api.groq.com/openai/v1"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         return f"{base}/chat/completions"
 
     elif p == "mistral":
         base = os.environ.get("MISTRAL_BASE_URL", settings.mistral_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://api.mistral.ai/v1"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         return f"{base}/chat/completions"
 
     elif p == "openrouter":
         base = os.environ.get("OPENROUTER_BASE_URL", settings.openrouter_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://openrouter.ai/api/v1"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         return f"{base}/chat/completions"
 
     else:
         base = os.environ.get("OPENAI_BASE_URL", settings.upstream_url).rstrip("/")
+        if is_self_referential_url(base, settings.port, settings.host):
+            base = "https://api.openai.com"
         if base.endswith("/chat/completions") or base.endswith("/v1/chat/completions"):
             return base
         elif base.endswith("/v1"):
@@ -499,7 +546,7 @@ def resolve_auth_headers(
     x_api_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """Resolve authorization headers for upstream provider."""
-    headers: Dict[str, str] = {}
+    headers: Dict[str, str] = {"X-TokenGuard-Hop": "1"}
     p = provider.lower().strip()
 
     client_auth = auth_header or request_headers.get("authorization")
@@ -525,7 +572,6 @@ def resolve_auth_headers(
         if bearer_val:
             headers["Authorization"] = bearer_val
 
-    # Forward vendor-specific headers
     for h, v in request_headers.items():
         hl = h.lower()
         if hl in ("openai-organization", "openai-project", "openai-beta", "x-goog-api-client", "x-goog-api-key"):
@@ -535,7 +581,6 @@ def resolve_auth_headers(
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
-    """Create and configure the FastAPI application."""
     if settings is None:
         settings = get_settings()
 
@@ -546,19 +591,55 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Enable CORS for browser dashboard and web clients
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://0.0.0.0",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
     @app.middleware("http")
-    async def add_tokenguard_headers(request: Request, call_next):
-        response = await call_next(request)
+    async def security_and_tokenguard_middleware(request: Request, call_next):
+        if request.headers.get("x-tokenguard-hop"):
+            return JSONResponse(
+                status_code=status.HTTP_508_LOOP_DETECTED,
+                content={
+                    "error": {
+                        "message": "Loop detected: recursive proxy forwarding blocked (X-TokenGuard-Hop detected)",
+                        "type": "loop_detected",
+                    }
+                },
+            )
+
         curr_settings = get_settings()
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                max_bytes = int(getattr(curr_settings, "max_payload_size_mb", 15.0) * 1024 * 1024)
+                if int(content_length) > max_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "error": {
+                                "message": f"Payload Too Large: maximum allowed size is {curr_settings.max_payload_size_mb}MB",
+                                "type": "payload_too_large",
+                            }
+                        },
+                    )
+            except ValueError:
+                pass
+
+        response = await call_next(request)
         is_dry = getattr(curr_settings, "dry_run", False) or (circuit_breaker and getattr(circuit_breaker, "dry_run", False))
         if is_dry:
             response.headers["X-TokenGuard-Dry-Run"] = "true"
@@ -572,26 +653,58 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 response.headers["X-TokenGuard-USD-Saved"] = f"{request.state.usd_saved:.4f}"
         return response
 
-    # Ensure static directory exists
+    def _verify_admin_token(request: Request) -> Optional[JSONResponse]:
+        curr_settings = get_settings()
+        if not getattr(curr_settings, "admin_token_required", True):
+            return None
+        expected = curr_settings.admin_token or get_admin_token()
+        token = request.headers.get("x-tokenguard-admin-token") or request.cookies.get("tokenguard_admin_token")
+        if not token or token != expected:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={
+                    "error": {
+                        "message": "Unauthorized: valid X-TokenGuard-Admin-Token header required",
+                        "type": "unauthorized",
+                    }
+                },
+            )
+        return None
+
+    def _verify_admin_token(request: Request) -> Optional[JSONResponse]:
+        curr_settings = get_settings()
+        if not getattr(curr_settings, "admin_token_required", True):
+            return None
+        expected = curr_settings.admin_token or get_admin_token()
+        token = request.headers.get("x-tokenguard-admin-token") or request.cookies.get("tokenguard_admin_token")
+        if not token or token != expected:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={
+                    "error": {
+                        "message": "Unauthorized: valid X-TokenGuard-Admin-Token header required",
+                        "type": "unauthorized",
+                    }
+                },
+            )
+        return None
+
     static_dir = Path(settings.static_path)
     static_dir.mkdir(parents=True, exist_ok=True)
     index_file = static_dir / "index.html"
 
-    # Mount static assets
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     next_dir = static_dir / "_next"
     if next_dir.exists():
         app.mount("/_next", StaticFiles(directory=str(next_dir)), name="next_static")
 
-    # --------------------------------------------------------------------------
-    # Frontend Dashboard Routes
-    # --------------------------------------------------------------------------
     @app.get("/", include_in_schema=False)
     @app.get("/dashboard", include_in_schema=False)
     async def serve_dashboard():
-        """Serve the TokenGuard single-page dashboard."""
+        admin_tok = get_admin_token()
+        admin_tok = get_admin_token()
         if index_file.exists():
-            return FileResponse(
+            resp = FileResponse(
                 str(index_file),
                 headers={
                     "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -599,7 +712,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "Expires": "0",
                 },
             )
-        return HTMLResponse("<h1>TokenGuard Dashboard is initializing...</h1>")
+            resp.set_cookie(
+                key="tokenguard_admin_token",
+                value=admin_tok,
+                httponly=False,
+                samesite="strict",
+            )
+            return resp
+        resp = HTMLResponse("<h1>TokenGuard Dashboard is initializing...</h1>")
+        resp.set_cookie(
+            key="tokenguard_admin_token",
+            value=admin_tok,
+            httponly=False,
+            samesite="strict",
+        )
+        return resp
 
     @app.get("/health")
     async def health_check():
@@ -612,12 +739,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "providers": ["openai", "anthropic", "gemini", "dashscope", "deepseek", "groq", "mistral", "openrouter"],
         }
 
-    # --------------------------------------------------------------------------
-    # Dashboard API Endpoints
-    # --------------------------------------------------------------------------
     @app.get("/api/stats")
     async def api_stats():
-        """Get aggregate metrics, spending status, and circuit breaker health."""
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -641,7 +764,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         offset: int = 0,
         status: Optional[str] = None,
     ):
-        """Retrieve recent LLM requests logged in SQLite."""
         current_settings = get_settings()
         records = await get_recent_requests(
             current_settings.db_path,
@@ -656,7 +778,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         format: str = "jsonl",
         status: Optional[str] = None,
     ):
-        """Export all logged requests in JSONL, HAR 1.2, CSV, or JSON format."""
         current_settings = get_settings()
         records = await get_all_requests_for_export(
             current_settings.db_path,
@@ -717,7 +838,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/events")
     @app.get("/api/stream")
     async def api_events(request: Request):
-        """Server-Sent Events endpoint broadcasting live state changes, logged requests, and reactive metrics in real-time."""
         async def event_generator():
             q = broadcaster.subscribe()
             try:
@@ -759,8 +879,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
 
     @app.post("/api/kill-switch")
-    async def api_toggle_kill_switch(payload: Optional[Dict[str, Any]] = None):
+    async def api_toggle_kill_switch(request: Request, payload: Optional[Dict[str, Any]] = None):
         """Toggle or set the manual kill switch and broadcast state change."""
+        auth_err = _verify_admin_token(request)
+        if auth_err:
+            return auth_err
+
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -783,8 +907,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
     @app.post("/api/config")
-    async def api_update_config(payload: Dict[str, Any]):
+    async def api_update_config(request: Request, payload: Dict[str, Any]):
         """Dynamically update limits (hourly budget, daily budget, loop threshold, profile)."""
+        auth_err = _verify_admin_token(request)
+        if auth_err:
+            return auth_err
+
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -823,8 +951,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
     @app.post("/api/reset")
-    async def api_reset(payload: Optional[Dict[str, Any]] = None):
+    async def api_reset(request: Request, payload: Optional[Dict[str, Any]] = None):
         """Reset in-memory circuit breaker state, spending tracking, and hash history."""
+        auth_err = _verify_admin_token(request)
+        if auth_err:
+            return auth_err
+
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -844,8 +976,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
     @app.post("/api/clear-logs")
-    async def api_clear_logs(payload: Optional[Dict[str, Any]] = None):
+    async def api_clear_logs(request: Request, payload: Optional[Dict[str, Any]] = None):
         """Clear database request logs and reset in-memory circuit breaker state."""
+        auth_err = _verify_admin_token(request)
+        if auth_err:
+            return auth_err
+
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -869,7 +1005,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.post("/api/simulate")
     async def api_simulate(payload: Optional[Dict[str, Any]] = None):
-        """Simulate LLM events (loop test, standard request, budget spike) for instant onboarding testing."""
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -1072,7 +1207,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.post("/api/test/simulate-tool-loop")
     async def api_simulate_tool_loop(payload: Optional[Dict[str, Any]] = None):
-        """Programmatically feed consecutive identical tool-call payloads through guard.py, trip the circuit breaker, and broadcast over SSE."""
         if circuit_breaker is None:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
 
@@ -1153,16 +1287,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="Circuit breaker not initialized")
         return {"prices": circuit_breaker.prices}
 
-    # --------------------------------------------------------------------------
-    # Universal Models Endpoint
-    # --------------------------------------------------------------------------
     @app.get("/v1/models")
     async def proxy_models(request: Request, authorization: Optional[str] = Header(None)):
         """Transparently proxy the /v1/models endpoint."""
         if http_client is None:
             raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
-        headers = {}
+        headers = {"X-TokenGuard-Hop": "1"}
         auth_header = (
             authorization
             or request.headers.get("authorization")
@@ -1184,7 +1315,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except Exception:
             pass
 
-        # Fallback to registered models
         if circuit_breaker:
             model_items = [
                 {"id": m_id, "object": "model", "created": 1700000000, "owned_by": detect_provider(m_id)}
@@ -1195,9 +1325,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         return JSONResponse(status_code=200, content={"object": "list", "data": [{"id": "gpt-4o", "object": "model"}]})
 
-    # --------------------------------------------------------------------------
-    # Anthropic Native Protocol (/v1/messages)
-    # --------------------------------------------------------------------------
     @app.post("/v1/messages")
     async def anthropic_messages(
         request: Request,
@@ -1211,7 +1338,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         current_settings = get_settings()
 
-        # 1. Parse JSON payload
         try:
             body = await request.json()
         except Exception as e:
@@ -1226,7 +1352,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         messages = body.get("messages", [])
         system_prompt = body.get("system")
         if system_prompt:
-            # Combine system prompt with messages for prompt hash calculation
             check_payload = [{"role": "system", "content": system_prompt}] + list(messages)
         else:
             check_payload = messages
@@ -1247,7 +1372,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         has_task_update = _detect_task_update(request.headers, body, check_payload)
         cache_hit = _detect_cache_hit(request.headers, body)
 
-        # 2. Pre-flight Circuit Breaker Guards
         try:
             circuit_breaker.check_request(
                 check_payload,
@@ -1276,6 +1400,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_tag = "blocked_loop"
             elif cb_err.error_type == "kill_switch_active":
                 status_tag = "blocked_killswitch"
+            elif err_code == "SecretLeakDetected" or cb_err.error_type == "secret_leak_detected":
+                status_tag = "blocked_secret_leak"
 
             est_tokens = circuit_breaker.estimate_prompt_tokens(check_payload)
             tokens_saved = getattr(cb_err, "tokens_saved", None)
@@ -1320,6 +1446,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
                 }
 
+                if cb_err.status_code == 400 or err_code == "SecretLeakDetected":
+                    return JSONResponse(
+                        status_code=400,
+                        content=cb_err.to_dict(),
+                    )
+
                 if err_code in ("TOOL_PING_PONG_LOOP", "ToolRetryCeilingTripped", "SessionStagnationTripped"):
                     err_dict = cb_err.to_dict()
                     if "error" in err_dict and isinstance(err_dict["error"], dict):
@@ -1333,7 +1465,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         headers=resp_headers,
                     )
 
-                # Return Anthropic-native error schema
                 return JSONResponse(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     content={
@@ -1350,7 +1481,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     headers=resp_headers,
                 )
 
-        # 3. Resolve Destination and Headers
+        if current_settings.redact_secrets or (circuit_breaker and circuit_breaker.redact_secrets):
+            body, _ = redact_secrets_in_obj(body)
+
         target_url = resolve_upstream_url("anthropic", endpoint="messages")
         forward_headers = resolve_auth_headers(
             provider="anthropic",
@@ -1362,7 +1495,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if is_streaming:
             forward_headers["Accept"] = "text/event-stream"
 
-        # 4. Handle Streaming vs Non-Streaming
         if is_streaming:
             return await _handle_anthropic_streaming(
                 http_client=http_client,
@@ -1390,9 +1522,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             session_id=session_id,
         )
 
-    # --------------------------------------------------------------------------
-    # Universal /v1/chat/completions (OpenAI, Gemini, DashScope/Qwen, Claude, etc.)
-    # --------------------------------------------------------------------------
     @app.post("/v1/chat/completions")
     async def chat_completions(
         request: Request,
@@ -1404,7 +1533,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         current_settings = get_settings()
 
-        # 1. Parse JSON payload
         try:
             body = await request.json()
         except Exception as e:
@@ -1431,7 +1559,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         has_task_update = _detect_task_update(request.headers, body, messages)
         cache_hit = _detect_cache_hit(request.headers, body)
 
-        # 2. Pre-flight Circuit Breaker Guards
         try:
             circuit_breaker.check_request(
                 messages,
@@ -1460,6 +1587,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_tag = "blocked_loop"
             elif cb_err.error_type == "kill_switch_active":
                 status_tag = "blocked_killswitch"
+            elif err_code == "SecretLeakDetected" or cb_err.error_type == "secret_leak_detected":
+                status_tag = "blocked_secret_leak"
 
             est_tokens = circuit_breaker.estimate_prompt_tokens(messages)
             tokens_saved = getattr(cb_err, "tokens_saved", None)
@@ -1511,18 +1640,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
                 }
                 return JSONResponse(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    status_code=cb_err.status_code,
                     content=resp_content,
                     headers=headers,
                 )
 
-        # 3. Detect Provider and Resolve Routing
+        if current_settings.redact_secrets or (circuit_breaker and circuit_breaker.redact_secrets):
+            body, _ = redact_secrets_in_obj(body)
+
         provider = detect_provider(model)
 
-        # Special Adapter: OpenAI client calling Claude model -> translate to Anthropic messages protocol
         if provider == "anthropic":
             anthropic_base = os.environ.get("ANTHROPIC_BASE_URL", current_settings.anthropic_url)
-            # If standard Anthropic URL is used, use Anthropic Messages adapter
             if "api.anthropic.com" in anthropic_base:
                 return await _handle_openai_to_anthropic_adapter(
                     http_client=http_client,
@@ -1537,7 +1666,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     session_id=session_id,
                 )
 
-        # Standard OpenAI-compatible upstream routing (OpenAI, Gemini, Qwen/DashScope, DeepSeek, Groq, Mistral, OpenRouter)
         upstream_url = resolve_upstream_url(provider, endpoint="chat/completions")
         forward_headers = resolve_auth_headers(
             provider=provider,
@@ -1547,7 +1675,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         forward_headers["Content-Type"] = "application/json"
         forward_headers["Accept"] = "text/event-stream" if is_streaming else "application/json"
 
-        # 4. Handle Streaming vs Non-Streaming
         if is_streaming:
             if "stream_options" not in body or not isinstance(body["stream_options"], dict):
                 body["stream_options"] = {"include_usage": True}
@@ -1580,9 +1707,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             session_id=session_id,
         )
 
-    # --------------------------------------------------------------------------
-    # Universal /v1/embeddings Endpoint
-    # --------------------------------------------------------------------------
     @app.post("/v1/embeddings")
     async def embeddings(
         request: Request,
@@ -1627,7 +1751,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "X-TokenGuard-Tokens-Saved": str(tokens_saved),
                     "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
                 }
-                return JSONResponse(status_code=429, content=resp_content, headers=resp_headers)
+                return JSONResponse(status_code=cb_err.status_code, content=resp_content, headers=resp_headers)
+
+        if current_settings.redact_secrets or (circuit_breaker and circuit_breaker.redact_secrets):
+            body, _ = redact_secrets_in_obj(body)
 
         provider = detect_provider(model)
         target_url = f"{current_settings.upstream_url.rstrip('/')}/v1/embeddings"
@@ -1668,9 +1795,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     return app
 
 
-# ------------------------------------------------------------------------------
-# Handlers: Anthropic Native Protocol
-# ------------------------------------------------------------------------------
 async def _handle_anthropic_non_streaming(
     http_client: httpx.AsyncClient,
     target_url: str,
@@ -1779,9 +1903,7 @@ async def _handle_anthropic_streaming(
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
-                # Immediately yield chunk to downstream client (< 5ms latency overhead)
                 yield chunk
-                # Non-blocking feed to background token accumulator
                 accumulator.feed(chunk)
         except (asyncio.CancelledError, GeneratorExit):
             is_cancelled = True
@@ -1791,7 +1913,6 @@ async def _handle_anthropic_streaming(
             logger.error(f"Error during Anthropic stream: {exc}")
             raise
         finally:
-            # Guarantee upstream socket is closed immediately
             try:
                 await upstream_resp.aclose()
             except Exception as e:
@@ -1834,9 +1955,6 @@ async def _handle_anthropic_streaming(
     )
 
 
-# ------------------------------------------------------------------------------
-# Handlers: OpenAI to Anthropic Schema Adapter
-# ------------------------------------------------------------------------------
 async def _handle_openai_to_anthropic_adapter(
     http_client: httpx.AsyncClient,
     body: Dict[str, Any],
@@ -1854,7 +1972,6 @@ async def _handle_openai_to_anthropic_adapter(
     forward_headers = resolve_auth_headers("anthropic", headers, auth_header=authorization)
     forward_headers["Content-Type"] = "application/json"
 
-    # 1. Transform OpenAI messages to Anthropic format
     system_prompt = None
     anthropic_msgs = []
     for msg in messages:
@@ -1943,7 +2060,6 @@ async def _handle_openai_to_anthropic_adapter(
                         except Exception:
                             pass
 
-                # Final stop chunk
                 stop_chunk = {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -2002,7 +2118,6 @@ async def _handle_openai_to_anthropic_adapter(
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
-    # Non-streaming OpenAI to Anthropic
     start_time = time.perf_counter()
     try:
         resp = await http_client.post(target_url, json=anthropic_payload, headers=forward_headers)
@@ -2027,7 +2142,6 @@ async def _handle_openai_to_anthropic_adapter(
             circuit_breaker.remove_last_session_entry(session_id)
         return Response(content=resp.content, status_code=resp.status_code, headers={"Content-Type": "application/json"})
 
-    # Extract text from Anthropic content blocks
     text_content = ""
     for block in data.get("content", []):
         if isinstance(block, dict) and block.get("type") == "text":
@@ -2073,9 +2187,6 @@ async def _handle_openai_to_anthropic_adapter(
     return JSONResponse(status_code=200, content=openai_response)
 
 
-# ------------------------------------------------------------------------------
-# Handlers: Standard OpenAI-Compatible Upstream
-# ------------------------------------------------------------------------------
 async def _handle_non_streaming_chat(
     http_client: httpx.AsyncClient,
     target_url: str,
@@ -2214,9 +2325,7 @@ async def _handle_streaming_chat(
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
-                # Immediately yield incoming chunk to downstream client (< 5ms latency overhead)
                 yield chunk
-                # Non-blocking feed to background token accumulator without blocking generator loop
                 accumulator.feed(chunk)
         except (asyncio.CancelledError, GeneratorExit):
             is_cancelled = True
@@ -2226,7 +2335,6 @@ async def _handle_streaming_chat(
             logger.error(f"Error during SSE chunk streaming: {exc}")
             raise
         finally:
-            # 1. Guarantee immediate socket close to prevent leaking upstream connections
             try:
                 await upstream_resp.aclose()
             except Exception as e:
@@ -2280,6 +2388,5 @@ async def _handle_streaming_chat(
     )
 
 
-# Default application instance for uvicorn
 app = create_app()
 

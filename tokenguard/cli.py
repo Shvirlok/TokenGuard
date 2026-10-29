@@ -30,6 +30,7 @@ from tokenguard.config import (
     PROFILES,
     Settings,
     detect_api_keys,
+    get_or_create_admin_token,
     get_settings,
     load_stored_config,
     mask_key,
@@ -74,7 +75,6 @@ def create_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
 
-    # 1. Start command
     start_parser = subparsers.add_parser("start", help="Start the TokenGuard proxy server and dashboard")
     _add_server_args(start_parser)
     start_parser.add_argument(
@@ -84,17 +84,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run TokenGuard in the background as a daemon process",
     )
 
-    # 2. Stop command
     stop_parser = subparsers.add_parser("stop", help="Stop any background TokenGuard daemon process")
     stop_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host address (default: 127.0.0.1)")
     stop_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 3. Status command
     status_parser = subparsers.add_parser("status", help="Check status of the TokenGuard daemon & proxy")
     status_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host address (default: 127.0.0.1)")
     status_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 4. Run command
     run_parser = subparsers.add_parser(
         "run",
         help="Run a command with OPENAI_BASE_URL and OPENAI_API_BASE automatically injected",
@@ -158,34 +155,47 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run in observation mode (detect and log trips, but pass requests through upstream)",
     )
     run_parser.add_argument(
+        "--block-secrets",
+        action="store_true",
+        default=os.environ.get("TOKENGUARD_BLOCK_SECRETS", "").lower() in ("true", "1", "yes"),
+        help="Abort request with HTTP 400 when API keys or private credentials are detected in prompt",
+    )
+    run_parser.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        default=os.environ.get("TOKENGUARD_REDACT_SECRETS", "").lower() in ("true", "1", "yes"),
+        help="Replace secrets with ***REDACTED_SECRET*** in-flight before forwarding upstream",
+    )
+    run_parser.add_argument(
+        "--max-payload-size-mb",
+        type=float,
+        default=float(os.environ.get("TOKENGUARD_MAX_PAYLOAD_SIZE_MB", 15.0)),
+        help="Maximum allowed payload size in MB before rejecting with HTTP 413 (default: 15.0)",
+    )
+    run_parser.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
         help="Command and arguments to execute (e.g. python agent.py or pytest)",
     )
 
-    # 5. Kill command (Reactive CLI Control)
     kill_parser = subparsers.add_parser("kill", help="Engage kill switch to immediately block all LLM requests")
     kill_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     kill_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 6. Resume command (Reactive CLI Control)
     resume_parser = subparsers.add_parser("resume", help="Disengage kill switch and resume normal guarding")
     resume_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     resume_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 7. Profile command (Reactive CLI Control)
     profile_parser = subparsers.add_parser("profile", help="Switch active guard profile (careful, standard, passive)")
     profile_parser.add_argument("name", nargs="?", default=None, choices=["careful", "standard", "passive"], help="Profile name (careful, standard, passive)")
     profile_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     profile_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 8. Clear command (Reactive CLI Control)
     clear_parser = subparsers.add_parser("clear", help="Clear all request logs and reset in-memory caches")
     clear_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     clear_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
     clear_parser.add_argument("--db-path", type=Path, default=Path("tokenguard.db"), help="SQLite database path")
 
-    # 9. Logs & Tail command (Live Stream)
     logs_parser = subparsers.add_parser("logs", help="View or stream live LLM request logs")
     logs_parser.add_argument("-f", "--follow", action="store_true", help="Stream live activity in real-time")
     logs_parser.add_argument("-n", "--lines", type=int, default=20, help="Number of recent lines to display (default: 20)")
@@ -199,7 +209,6 @@ def create_parser() -> argparse.ArgumentParser:
     tail_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     tail_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 10. Prices command
     prices_parser = subparsers.add_parser("prices", help="Display local pricing table")
     prices_parser.add_argument(
         "-u",
@@ -219,7 +228,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to custom prices.json file",
     )
 
-    # 11. Interactive Menu / TUI command
     menu_parser = subparsers.add_parser("menu", help="Launch interactive navigation menu (Claude/Qwen Code style)")
     menu_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     menu_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
@@ -228,12 +236,10 @@ def create_parser() -> argparse.ArgumentParser:
     tui_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     tui_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 12. Dashboard command
     dash_parser = subparsers.add_parser("dashboard", help="Open TokenGuard web dashboard in browser")
     dash_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     dash_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 13. Simulate command
     sim_parser = subparsers.add_parser("simulate", help="Run instant circuit breaker simulation")
     sim_parser.add_argument(
         "--type",
@@ -246,7 +252,6 @@ def create_parser() -> argparse.ArgumentParser:
     sim_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     sim_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
-    # 14. Export command (Telemetry Export)
     export_parser = subparsers.add_parser(
         "export",
         help="Export telemetry logs in JSONL, HAR 1.2, JSON, or CSV format",
@@ -291,7 +296,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Proxy port (default: 8080)",
     )
 
-    # 15. Env command (Terminal Environment Injector)
     env_parser = subparsers.add_parser(
         "env",
         help="Print shell export/unset commands to route LLM SDKs through TokenGuard",
@@ -314,7 +318,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Proxy port (default: 8080)",
     )
 
-    # Also allow root flags for quick default start
     _add_server_args(parser)
     parser.add_argument(
         "-d",
@@ -407,6 +410,24 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         help="SQLite database path for request logging (default: tokenguard.db)",
     )
     p.add_argument(
+        "--block-secrets",
+        action="store_true",
+        default=os.environ.get("TOKENGUARD_BLOCK_SECRETS", "").lower() in ("true", "1", "yes"),
+        help="Abort request with HTTP 400 when API keys or private credentials are detected in prompt",
+    )
+    p.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        default=os.environ.get("TOKENGUARD_REDACT_SECRETS", "").lower() in ("true", "1", "yes"),
+        help="Replace secrets with ***REDACTED_SECRET*** in-flight before forwarding upstream",
+    )
+    p.add_argument(
+        "--max-payload-size-mb",
+        type=float,
+        default=float(os.environ.get("TOKENGUARD_MAX_PAYLOAD_SIZE_MB", 15.0)),
+        help="Maximum allowed payload size in MB before rejecting with HTTP 413 (default: 15.0)",
+    )
+    p.add_argument(
         "--reload",
         action="store_true",
         help="Enable auto-reload for local development",
@@ -471,7 +492,6 @@ def get_daemon_pid() -> Optional[int]:
                 pid = int(pid_str)
                 if is_pid_alive(pid):
                     return pid
-                # Remove stale PID file
                 PID_FILE.unlink(missing_ok=True)
         except Exception:
             pass
@@ -512,6 +532,9 @@ def start_daemon(
     dry_run: bool = False,
     max_tool_repeats: int = 3,
     max_stagnant_steps: int = 6,
+    block_secrets: bool = False,
+    redact_secrets: bool = False,
+    max_payload_size_mb: float = 15.0,
 ) -> int:
     """Spawn TokenGuard proxy in background as a daemon process."""
     existing_pid = get_daemon_pid()
@@ -545,11 +568,17 @@ def start_daemon(
         str(upstream_url),
         "--db-path",
         str(db_path),
+        "--max-payload-size-mb",
+        str(max_payload_size_mb),
     ]
     if passive:
         cmd.append("--passive")
     if dry_run:
         cmd.append("--dry-run")
+    if block_secrets:
+        cmd.append("--block-secrets")
+    if redact_secrets:
+        cmd.append("--redact-secrets")
     if max_burn_rate:
         cmd.extend(["--max-burn-rate", str(max_burn_rate)])
 
@@ -664,7 +693,6 @@ def show_status(host: str = "127.0.0.1", port: int = 8080) -> None:
         blkd = stats.get("blocked_requests", 0)
         table.add_row("Requests:", f"{total_reqs} [dim]({succ} ok, {blkd} blocked)[/dim]")
 
-        # Detected keys
         keys = detect_api_keys()
         key_strs = []
         if keys.get("OPENAI_API_KEY"):
@@ -730,8 +758,14 @@ def cmd_kill(args: argparse.Namespace) -> None:
         )
         return
     try:
+        token = get_or_create_admin_token()
+        headers = {"X-TokenGuard-Admin-Token": token}
         with httpx.Client(timeout=3.0) as client:
-            res = client.post(f"http://{host}:{port}/api/kill-switch", json={"active": True, "source": "cli"})
+            res = client.post(
+                f"http://{host}:{port}/api/kill-switch",
+                json={"active": True, "source": "cli"},
+                headers=headers,
+            )
             if res.status_code == 200:
                 console.print(
                     Panel(
@@ -766,8 +800,14 @@ def cmd_resume(args: argparse.Namespace) -> None:
         )
         return
     try:
+        token = get_or_create_admin_token()
+        headers = {"X-TokenGuard-Admin-Token": token}
         with httpx.Client(timeout=3.0) as client:
-            res = client.post(f"http://{host}:{port}/api/kill-switch", json={"active": False, "source": "cli"})
+            res = client.post(
+                f"http://{host}:{port}/api/kill-switch",
+                json={"active": False, "source": "cli"},
+                headers=headers,
+            )
             if res.status_code == 200:
                 console.print(
                     Panel(
@@ -819,7 +859,6 @@ def _read_raw_key(fd: int) -> str:
         if not raw_bytes:
             return 'enter'
 
-        # ANSI / VT100 / xterm arrow key sequences
         if raw_bytes in (b'\x1b[A', b'\x1bOA', b'\x1b[1;2A', b'\x1b[1;5A'):
             return 'up'
         if raw_bytes in (b'\x1b[B', b'\x1bOB', b'\x1b[1;2B', b'\x1b[1;5B'):
@@ -884,11 +923,11 @@ def render_interactive_menu(
 ) -> Panel:
     """Render a clean Rich panel with numbered, arrow-navigable menu options with explicit column widths."""
     table = Table.grid(padding=(0, 1), expand=False)
-    table.add_column(width=8, justify="left", no_wrap=True)   # Column 1: Index & Selector
-    table.add_column(width=24, justify="left", no_wrap=True)  # Column 2: Action Title
-    table.add_column(width=1, justify="center", no_wrap=True) # Column 3: Subtle separator '·'
-    table.add_column(width=32, justify="left", no_wrap=True)  # Column 4: Description
-    table.add_column(width=6, justify="right", no_wrap=True)  # Column 5: Badge/Tag
+    table.add_column(width=8, justify="left", no_wrap=True)
+    table.add_column(width=24, justify="left", no_wrap=True)
+    table.add_column(width=1, justify="center", no_wrap=True)
+    table.add_column(width=32, justify="left", no_wrap=True)
+    table.add_column(width=6, justify="right", no_wrap=True)
 
     for i, opt in enumerate(options):
         opt_id = opt[0]
@@ -980,7 +1019,6 @@ def interactive_select(
         except Exception:
             pass
 
-    # Hide terminal cursor during interactive selection
     try:
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
@@ -1016,7 +1054,6 @@ def interactive_select(
                     elif 1 <= val <= len(options):
                         return options[val - 1][0]
     finally:
-        # Restore terminal cursor and settings
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
         if old_settings is not None and sys.platform != "win32":
@@ -1030,7 +1067,6 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
         return
 
     while True:
-        # Check if server is running; if not, ask if user wants to start it
         if not is_server_running(host, port):
             console.print(
                 Panel(
@@ -1053,7 +1089,6 @@ def interactive_control_menu(host: str = "127.0.0.1", port: int = 8080) -> None:
             )
             time.sleep(0.5)
 
-        # Query live stats from daemon
         active_prof = "Careful"
         is_killed = False
         saved_usd = 0.0
@@ -1207,6 +1242,8 @@ def cmd_profile(args: argparse.Namespace) -> None:
 
     if is_server_running(host, port):
         try:
+            token = get_or_create_admin_token()
+            headers = {"X-TokenGuard-Admin-Token": token}
             with httpx.Client(timeout=3.0) as client:
                 client.post(
                     f"http://{host}:{port}/api/config",
@@ -1217,6 +1254,7 @@ def cmd_profile(args: argparse.Namespace) -> None:
                         "profile": name,
                         "source": "cli",
                     },
+                    headers=headers,
                 )
         except Exception as e:
             pass
@@ -1262,8 +1300,14 @@ def cmd_clear(args: argparse.Namespace) -> None:
         return
 
     try:
+        token = get_or_create_admin_token()
+        headers = {"X-TokenGuard-Admin-Token": token}
         with httpx.Client(timeout=3.0) as client:
-            res = client.post(f"http://{host}:{port}/api/clear-logs", json={"source": "cli"})
+            res = client.post(
+                f"http://{host}:{port}/api/clear-logs",
+                json={"source": "cli"},
+                headers=headers,
+            )
             if res.status_code == 200:
                 console.print(
                     Panel(
@@ -1432,6 +1476,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     """Start the proxy server and dashboard in foreground or daemon mode."""
     is_passive = getattr(args, "passive", False)
     is_dry_run = getattr(args, "dry_run", False)
+    block_secrets = getattr(args, "block_secrets", False)
+    redact_secrets = getattr(args, "redact_secrets", False)
+    max_payload_size_mb = getattr(args, "max_payload_size_mb", 15.0)
     limit = 1000.0 if is_passive else args.limit
     daily_limit = 5000.0 if is_passive else args.daily_limit
     loop_threshold = 0 if is_passive else args.loop_threshold
@@ -1454,6 +1501,9 @@ def cmd_start(args: argparse.Namespace) -> None:
                 dry_run=is_dry_run,
                 max_tool_repeats=max_tool_repeats,
                 max_stagnant_steps=max_stagnant_steps,
+                block_secrets=block_secrets,
+                redact_secrets=redact_secrets,
+                max_payload_size_mb=max_payload_size_mb,
             )
 
         if wait_for_server(args.host, args.port, timeout=5.0):
@@ -1505,6 +1555,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         profile="passive" if is_passive else "careful",
         passive=is_passive,
         dry_run=is_dry_run,
+        block_secrets=block_secrets,
+        redact_secrets=redact_secrets,
+        max_payload_size_mb=max_payload_size_mb,
     )
     set_settings(settings)
 
@@ -1551,13 +1604,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     port = getattr(args, "port", 8080)
     is_passive = getattr(args, "passive", False)
     is_dry_run = getattr(args, "dry_run", False)
+    block_secrets = getattr(args, "block_secrets", False)
+    redact_secrets = getattr(args, "redact_secrets", False)
+    max_payload_size_mb = getattr(args, "max_payload_size_mb", 15.0)
     limit = 1000.0 if is_passive else getattr(args, "limit", 5.0)
     daily_limit = 5000.0 if is_passive else getattr(args, "daily_limit", 50.0)
     loop_threshold = 0 if is_passive else getattr(args, "loop_threshold", 3)
     max_tool_repeats = 0 if is_passive else getattr(args, "max_tool_repeats", _env_int("TOKENGUARD_MAX_TOOL_REPEATS", 3))
     max_stagnant_steps = 0 if is_passive else getattr(args, "max_stagnant_steps", _env_int("TOKENGUARD_MAX_STAGNANT_STEPS", 6))
 
-    # 1. Check if TokenGuard proxy is already running; if not, auto-start daemon
     if not is_server_running(host, port):
         with console.status(f"[bright_black]Auto-starting TokenGuard proxy on http://{host}:{port}...[/bright_black]", spinner="dots"):
             pid = start_daemon(
@@ -1574,6 +1629,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                 dry_run=is_dry_run,
                 max_tool_repeats=max_tool_repeats,
                 max_stagnant_steps=max_stagnant_steps,
+                block_secrets=block_secrets,
+                redact_secrets=redact_secrets,
+                max_payload_size_mb=max_payload_size_mb,
             )
 
         if not is_server_running(host, port):
@@ -1582,7 +1640,6 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         console.print(f"[bold green]●[/bold green] [dim]TokenGuard proxy running (PID: {pid})[/dim]")
 
-    # 2. Inject environment variables pointing to TokenGuard proxy
     proxy_url = f"http://{host}:{port}/v1"
     env = os.environ.copy()
     env["OPENAI_BASE_URL"] = proxy_url
@@ -1595,12 +1652,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     env["GROQ_BASE_URL"] = proxy_url
     env["MISTRAL_API_BASE"] = proxy_url
 
-    # Resolve executable if 'python' was invoked but only python3/sys.executable exists in environment
     import shutil
     if raw_cmd[0] == "python" and not shutil.which("python"):
         raw_cmd[0] = sys.executable
 
-    # 3. Transparently execute user command
     try:
         res = subprocess.run(raw_cmd, env=env)
         sys.exit(res.returncode)
@@ -1613,7 +1668,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8080)
 
-    # If proxy is already running, display status and open interactive command menu
     if is_server_running(host, port):
         show_status(host, port)
         console.print(
@@ -1633,7 +1687,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
             interactive_control_menu(host, port)
         return
 
-    # Header Panel
     console.print(
         Panel(
             "[bold bright_white]TokenGuard[/bold bright_white] [dim]— Zero-Latency LLM Circuit Breaker & Multi-Provider Proxy[/dim]\n"
@@ -1644,7 +1697,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
         )
     )
 
-    # 1. Detect existing API keys
     keys = detect_api_keys()
     has_keys = any(bool(v) for v in keys.values())
 
@@ -1679,7 +1731,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
         )
     )
 
-    # If no keys found and running interactively, offer quick input
     if not has_keys and sys.stdin.isatty():
         try:
             user_key = Prompt.ask(
@@ -1703,7 +1754,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
         except (KeyboardInterrupt, EOFError):
             pass
 
-    # 2. Guard Profile Selection via Arrow Keys & Numbers
     profile_opts = [
         ("careful", "Careful", "$5/hr cap, 2-loop cutoff, alerts ON", "RECOMMENDED"),
         ("standard", "Standard Agent", "$15/hr cap, 4-loop cutoff", "AUTONOMOUS"),
@@ -1717,7 +1767,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
     )
     profile = PROFILES.get(selected_profile_key, PROFILES["careful"])
 
-    # 3. Start background daemon
     with console.status("[bright_black]Starting TokenGuard daemon in background...[/bright_black]", spinner="dots"):
         pid = start_daemon(
             host=host,
@@ -1730,7 +1779,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
             db_path=getattr(args, "db_path", Path("tokenguard.db")),
         )
 
-    # 4. Display Claude Code / Qwen Code Status & Launch Panel
     status_table = Table.grid(padding=(0, 2))
     status_table.add_column(style="dim", justify="right")
     status_table.add_column(style="bright_white")
@@ -1768,7 +1816,6 @@ def cmd_quickstart(args: argparse.Namespace) -> None:
         )
     )
 
-    # If running interactively, offer the control menu immediately
     if sys.stdin.isatty():
         interactive_control_menu(host, port)
 
@@ -1846,10 +1893,8 @@ def cmd_prices(args: argparse.Namespace) -> None:
     table.add_column("Output Rate ($/1M)", justify="right", style="bright_white", no_wrap=True)
     table.add_column("Provider", style="dim", no_wrap=True)
 
-    # Filter and sort models: if large dynamic list, prioritize non-namespaced or common models
     sorted_keys = sorted(data.keys())
     if len(sorted_keys) > 60 and not do_update:
-        # Show top clean model names
         display_keys = [k for k in sorted_keys if "/" not in k]
         if not display_keys:
             display_keys = sorted_keys[:60]
@@ -1996,7 +2041,6 @@ def cmd_simulate(args: argparse.Namespace) -> None:
     sim_model = getattr(args, "model", "gpt-4o")
 
     if sim_type in ("alternating_loop", "alternating"):
-        # Check if live proxy server is responding
         if is_server_running(host, port):
             try:
                 with httpx.Client(timeout=5.0) as client:
@@ -2010,9 +2054,8 @@ def cmd_simulate(args: argparse.Namespace) -> None:
                             _render_alternating_loop_demo(data, is_local=False, host=host, port=port)
                             return
             except Exception:
-                pass  # Fall back to local simulation
+                pass
 
-        # Local in-process simulation demo (A-B-A-B cycle)
         from tokenguard.guard import CircuitBreaker, ToolPingPongError
         guard = CircuitBreaker(tool_loop_threshold=3)
         session_id = f"demo_alt_{int(time.time())}"
@@ -2065,7 +2108,6 @@ def cmd_simulate(args: argparse.Namespace) -> None:
         _render_alternating_loop_demo(data, is_local=True)
         return
 
-    # Standard simulations (loop, budget, success, tool_loop)
     try:
         with httpx.Client(timeout=5.0) as client:
             res = client.post(

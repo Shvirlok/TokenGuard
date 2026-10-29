@@ -68,7 +68,6 @@ def test_provider_detection_and_urls(custom_settings: Settings):
 
     assert detect_provider("openrouter/meta-llama/llama-3") == "openrouter"
 
-    # URL resolution checks
     assert resolve_upstream_url("gemini") == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     assert resolve_upstream_url("dashscope") == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
     assert resolve_upstream_url("deepseek") == "https://api.deepseek.com/chat/completions"
@@ -129,12 +128,10 @@ async def test_gemini_openai_gateway_proxying(custom_settings: Settings, monkeyp
         assert "generativelanguage.googleapis.com" in captured_url
         assert captured_headers.get("Authorization") == "Bearer AIzaSyFakeGeminiKey123456789"
 
-        # Check stats
         stats_resp = client.get("/api/stats")
         stats = stats_resp.json()
         assert stats["total_requests"] == 1
         assert stats["success_requests"] == 1
-        # gemini-2.0-flash input: $0.10/1M, output: $0.40/1M -> (100*0.10 + 50*0.40)/1M = 0.000030 USD
         assert stats["total_spent"] > 0.000025
 
 
@@ -188,10 +185,8 @@ async def test_qwen_dashscope_proxying(custom_settings: Settings, monkeypatch):
         assert "dashscope" in captured_url
         assert captured_headers.get("Authorization") == "Bearer sk-dashscope-secret-token"
 
-        # Check stats
         stats = client.get("/api/stats").json()
         assert stats["total_requests"] == 1
-        # qwen-max: input 2.80, output 8.40 -> (200*2.80 + 100*8.40)/1M = 0.00140 USD
         assert 0.0013 < stats["total_spent"] < 0.0015
 
 
@@ -242,10 +237,8 @@ async def test_anthropic_native_messages_endpoint(custom_settings: Settings, mon
         assert "api.anthropic.com/v1/messages" in captured_url
         assert captured_headers.get("x-api-key") == "sk-ant-custom-client-key"
 
-        # Check stats
         stats = client.get("/api/stats").json()
         assert stats["total_requests"] == 1
-        # claude-3-5-sonnet: input $3.00/1M, output $15.00/1M -> (50*3.0 + 25*15.0)/1M = 0.000525 USD
         assert 0.00050 < stats["total_spent"] < 0.00055
 
 
@@ -272,15 +265,12 @@ async def test_anthropic_messages_loop_breaker(custom_settings: Settings, monkey
             "max_tokens": 500,
         }
 
-        # Attempt 1 -> 200 Allowed
         r1 = client.post("/v1/messages", json=payload)
         assert r1.status_code == 200
 
-        # Attempt 2 -> 200 Allowed
         r2 = client.post("/v1/messages", json=payload)
         assert r2.status_code == 200
 
-        # Attempt 3 (threshold=3) -> 429 Blocked
         r3 = client.post("/v1/messages", json=payload)
         assert r3.status_code == 429
         data = r3.json()
@@ -288,7 +278,6 @@ async def test_anthropic_messages_loop_breaker(custom_settings: Settings, monkey
         assert data.get("error", {}).get("type") == "rate_limit_error"
         assert "infinite agent loop detected" in data.get("error", {}).get("message", "")
 
-        # Check stats
         stats = client.get("/api/stats").json()
         assert stats["total_requests"] == 3
         assert stats["blocked_requests"] == 1
@@ -302,7 +291,6 @@ async def test_claude_openai_adapter(custom_settings: Settings, monkeypatch):
 
     with TestClient(app) as client:
         async def mock_post(url, json=None, headers=None, **kwargs):
-            # Assert that the adapter converted OpenAI schema to Anthropic Messages schema
             assert "messages" in json
             assert json["messages"][0]["role"] == "user"
             assert json["system"] == "You are a helpful coding assistant"
@@ -322,7 +310,6 @@ async def test_claude_openai_adapter(custom_settings: Settings, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
         monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
 
-        # Send standard OpenAI chat completions format
         resp = client.post(
             "/v1/chat/completions",
             json={
@@ -336,7 +323,6 @@ async def test_claude_openai_adapter(custom_settings: Settings, monkeypatch):
 
         assert resp.status_code == 200
         data = resp.json()
-        # Verify adapted response is standard OpenAI chat.completion
         assert data["object"] == "chat.completion"
         assert data["choices"][0]["message"]["content"] == "Translated Claude answer"
         assert data["usage"]["total_tokens"] == 100
@@ -369,7 +355,6 @@ async def test_groq_and_mistral_proxying(custom_settings: Settings, monkeypatch)
         monkeypatch.setenv("MISTRAL_API_KEY", "mistral_api_key_456")
         monkeypatch.setattr(proxy_module.http_client, "post", mock_post)
 
-        # Groq Llama call
         r_groq = client.post(
             "/v1/chat/completions",
             json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": "test groq"}]},
@@ -377,7 +362,6 @@ async def test_groq_and_mistral_proxying(custom_settings: Settings, monkeypatch)
         assert r_groq.status_code == 200
         assert groq_called is True
 
-        # Mistral call
         r_mistral = client.post(
             "/v1/chat/completions",
             json={"model": "mistral-large-latest", "messages": [{"role": "user", "content": "test mistral"}]},

@@ -208,7 +208,6 @@ async def export_telemetry_async(
         content = format_csv_export(records)
         ext = "csv"
     else:
-        # Default to jsonl
         content = format_jsonl_export(records)
         ext = "jsonl"
         fmt = "jsonl"

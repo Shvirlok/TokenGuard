@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 from pydantic import Field
@@ -51,6 +52,11 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=False, description="Observation mode (detect and log trips, but pass requests through upstream)")
     max_tool_repeats: int = Field(default=3, description="Maximum consecutive calls per tool name before tripping (0 to disable)")
     max_stagnant_steps: int = Field(default=6, description="Maximum consecutive non-mutating steps without state change before tripping (0 to disable)")
+    block_secrets: bool = Field(default=False, description="Abort requests containing detected raw secrets/API keys")
+    redact_secrets: bool = Field(default=False, description="Redact detected secrets in messages before upstream forwarding")
+    max_payload_size_mb: float = Field(default=15.0, description="Maximum allowed request payload size in MB before returning HTTP 413")
+    admin_token: Optional[str] = Field(default=None, description="Admin token for authenticating mutating control API routes")
+    admin_token_required: bool = Field(default=True, description="Enforce X-TokenGuard-Admin-Token on mutating /api/* routes")
 
     def model_post_init(self, __context) -> None:
         if self.max_repeats is not None:
@@ -68,6 +74,50 @@ TokenGuardConfig = Settings
 
 USER_CONFIG_DIR = Path.home() / ".tokenguard"
 USER_CONFIG_FILE = USER_CONFIG_DIR / "config.json"
+ADMIN_TOKEN_FILE = USER_CONFIG_DIR / "admin.token"
+
+
+def get_or_create_admin_token() -> str:
+    """Ensure a secure admin token exists at ~/.tokenguard/admin.token (mode 0600) and return it."""
+    try:
+        USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(USER_CONFIG_DIR, 0o700)
+        except OSError:
+            pass
+
+        if ADMIN_TOKEN_FILE.exists():
+            try:
+                token = ADMIN_TOKEN_FILE.read_text(encoding="utf-8").strip()
+                if token:
+                    return token
+            except Exception:
+                pass
+
+        token = secrets.token_hex(32)
+        temp_file = USER_CONFIG_DIR / "admin.token.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(token)
+        try:
+            os.chmod(temp_file, 0o600)
+        except OSError:
+            pass
+        temp_file.replace(ADMIN_TOKEN_FILE)
+        try:
+            os.chmod(ADMIN_TOKEN_FILE, 0o600)
+        except OSError:
+            pass
+        return token
+    except Exception:
+        return secrets.token_hex(32)
+
+
+def get_admin_token() -> str:
+    """Return active admin token from settings or local token file."""
+    settings = get_settings()
+    if settings.admin_token:
+        return settings.admin_token
+    return get_or_create_admin_token()
 
 PROFILES = {
     "careful": {
