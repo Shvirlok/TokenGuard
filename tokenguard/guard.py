@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+from collections import OrderedDict
 import difflib
 import hashlib
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from threading import RLock
 import time
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1131,80 +1133,93 @@ def calculate_avoided_cost(
     return prompt_cost + completion_cost
 
 
-class ExpiringLRUDict(collections.OrderedDict):
+class ExpiringLRUDict(OrderedDict):
     def __init__(
         self,
         max_size: int = 1000,
         ttl_seconds: float = 3600.0,
         default_factory: Optional[Callable[[], Any]] = None,
+        *args,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(*args, **kwargs)
         self.max_size = max_size
         self.ttl_seconds = ttl_seconds
         self.default_factory = default_factory
-        self._timestamps: Dict[Any, float] = {}
-        self._lock = threading.RLock()
+        self._timestamps = {}
+        self._lock = RLock()
 
     def __getitem__(self, key: Any) -> Any:
         with self._lock:
+            if not super().__contains__(key):
+                if self.default_factory is not None:
+                    val = self.default_factory()
+                    self[key] = val
+                    return val
+                raise KeyError(key)
+
             now = time.time()
-            if super().__contains__(key):
-                if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                    super().pop(key, None)
-                    self._timestamps.pop(key, None)
-                    if self.default_factory is not None:
-                        val = self.default_factory()
-                        self[key] = val
-                        return val
-                    raise KeyError(key)
+            if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
+                super().pop(key, None)
+                self._timestamps.pop(key, None)
+                if self.default_factory is not None:
+                    val = self.default_factory()
+                    self[key] = val
+                    return val
+                raise KeyError(key)
+
+            try:
                 self.move_to_end(key)
-                self._timestamps[key] = now
-                return super().__getitem__(key)
-            if self.default_factory is not None:
-                val = self.default_factory()
-                self[key] = val
-                return val
-            raise KeyError(key)
+            except KeyError:
+                pass
+            return super().__getitem__(key)
 
     def __setitem__(self, key: Any, value: Any) -> None:
         with self._lock:
             now = time.time()
-            if super().__contains__(key):
-                self.move_to_end(key)
-            self._timestamps[key] = now
-            super().__setitem__(key, value)
             self._prune(now)
+            super().__setitem__(key, value)
+            self._timestamps[key] = now
+            try:
+                self.move_to_end(key)
+            except KeyError:
+                pass
 
-    def _prune(self, now: float) -> None:
-        expired = [k for k, ts in list(self._timestamps.items()) if now - ts > self.ttl_seconds]
-        for k in expired:
-            super().pop(k, None)
-            self._timestamps.pop(k, None)
-        while len(self) > self.max_size:
-            oldest = next(iter(self))
-            super().pop(oldest, None)
-            self._timestamps.pop(oldest, None)
+            while len(self) > self.max_size:
+                oldest = next(iter(self))
+                super().pop(oldest, None)
+                self._timestamps.pop(oldest, None)
 
     def __contains__(self, key: Any) -> bool:
         with self._lock:
-            if super().__contains__(key):
-                if time.time() - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                    super().pop(key, None)
-                    self._timestamps.pop(key, None)
-                    return False
-                return True
-            return False
+            if not super().__contains__(key):
+                return False
+            now = time.time()
+            if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
+                super().pop(key, None)
+                self._timestamps.pop(key, None)
+                return False
+            return True
 
     def get(self, key: Any, default: Any = None) -> Any:
-        with self._lock:
-            if key in self:
-                return self[key]
+        try:
+            return self[key]
+        except KeyError:
             return default
 
-    def pop(self, key: Any, default: Any = None) -> Any:
+    def pop(self, key: Any, *args) -> Any:
         with self._lock:
             self._timestamps.pop(key, None)
-            return super().pop(key, default)
+            return super().pop(key, *args)
+
+    def _prune(self, now: float) -> None:
+        expired = [
+            k for k, ts in list(self._timestamps.items())
+            if now - ts > self.ttl_seconds
+        ]
+        for k in expired:
+            super().pop(k, None)
+            self._timestamps.pop(k, None)
 
     def clear(self) -> None:
         with self._lock:
@@ -1214,8 +1229,11 @@ class ExpiringLRUDict(collections.OrderedDict):
     def touch(self, key: Any) -> None:
         with self._lock:
             now = time.time()
-            if key in self:
-                self.move_to_end(key)
+            if super().__contains__(key):
+                try:
+                    self.move_to_end(key)
+                except KeyError:
+                    pass
                 self._timestamps[key] = now
 
     def prune_expired(self) -> None:
