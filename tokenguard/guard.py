@@ -1150,7 +1150,7 @@ class ExpiringLRUDict(collections.OrderedDict):
             now = time.time()
             if super().__contains__(key):
                 if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                    self.pop(key, None)
+                    super().pop(key, None)
                     self._timestamps.pop(key, None)
                     if self.default_factory is not None:
                         val = self.default_factory()
@@ -1178,18 +1178,18 @@ class ExpiringLRUDict(collections.OrderedDict):
     def _prune(self, now: float) -> None:
         expired = [k for k, ts in list(self._timestamps.items()) if now - ts > self.ttl_seconds]
         for k in expired:
-            self.pop(k, None)
+            super().pop(k, None)
             self._timestamps.pop(k, None)
         while len(self) > self.max_size:
             oldest = next(iter(self))
-            self.pop(oldest, None)
+            super().pop(oldest, None)
             self._timestamps.pop(oldest, None)
 
     def __contains__(self, key: Any) -> bool:
         with self._lock:
             if super().__contains__(key):
                 if time.time() - self._timestamps.get(key, 0.0) > self.ttl_seconds:
-                    self.pop(key, None)
+                    super().pop(key, None)
                     self._timestamps.pop(key, None)
                     return False
                 return True
@@ -1201,10 +1201,10 @@ class ExpiringLRUDict(collections.OrderedDict):
                 return self[key]
             return default
 
-    def pop(self, key: Any, *args: Any) -> Any:
+    def pop(self, key: Any, default: Any = None) -> Any:
         with self._lock:
             self._timestamps.pop(key, None)
-            return super().pop(key, *args)
+            return super().pop(key, default)
 
     def clear(self) -> None:
         with self._lock:
