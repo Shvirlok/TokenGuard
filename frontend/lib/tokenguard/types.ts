@@ -2,13 +2,27 @@ export type RequestStatus =
   | 'success'
   | 'blocked_loop'
   | 'blocked_tool_loop'
+  | 'blocked_tool_retry_ceiling'
+  | 'blocked_stagnation'
+  | 'blocked_secret_leak'
+  | 'blocked_stream_loop'
+  | 'blocked_session_budget'
   | 'blocked_budget'
   | 'blocked_killswitch'
   | 'blocked_burn_rate'
   | 'blocked_context_ballooning'
 export type StatusFilter = 'all' | 'success' | 'blocked'
 export type ProfileId = 'careful' | 'standard' | 'passive'
-export type SimulationType = 'loop' | 'tool_loop' | 'success' | 'budget'
+export type SimulationType =
+  | 'loop'
+  | 'tool_loop'
+  | 'alternating_loop'
+  | 'drift'
+  | 'stagnation'
+  | 'secret'
+  | 'stream_loop'
+  | 'success'
+  | 'budget'
 export type ExportFormat = 'csv' | 'json'
 
 export interface RequestRecord {
@@ -32,6 +46,11 @@ export interface Stats {
   blocked_budget_count: number
   blocked_loop_count: number
   blocked_tool_loop_count?: number
+  blocked_retry_ceiling_count?: number
+  blocked_stagnation_count?: number
+  blocked_secret_count?: number
+  blocked_stream_loop_count?: number
+  blocked_session_budget_count?: number
   blocked_killswitch_count: number
   total_spent: number
   total_prompt_tokens: number
@@ -46,8 +65,14 @@ export interface Stats {
   saved_cost_estimate: number
   kill_switch_active: boolean
   active_profile: ProfileId | string
+  dry_run?: boolean
   hourly_limit: number
   daily_limit: number
+  session_limit?: number
+  max_tool_repeats?: number
+  max_stagnant_steps?: number
+  block_secrets?: boolean
+  redact_secrets?: boolean
   current_hourly_spend: number
   current_daily_spend: number
   hourly_budget_used_percent: number
@@ -71,7 +96,12 @@ export type PriceTable = Record<string, { input: number; output: number }>
 export interface LimitsUpdate {
   hourly_limit?: number
   daily_limit?: number
+  session_limit?: number
   loop_threshold?: number
+  max_tool_repeats?: number
+  max_stagnant_steps?: number
+  block_secrets?: boolean
+  redact_secrets?: boolean
   profile?: ProfileId
 }
 

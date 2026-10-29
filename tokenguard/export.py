@@ -1,5 +1,3 @@
-"""Telemetry export module for TokenGuard supporting JSONL, HAR 1.2, JSON, and CSV."""
-
 from __future__ import annotations
 
 import csv

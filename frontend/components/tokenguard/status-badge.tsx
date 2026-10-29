@@ -13,6 +13,26 @@ const STYLES: Record<string, { label: string; className: string }> = {
     label: 'TOOL RETRY LOOP: HARD STOP',
     className: 'border-rose-500/80 bg-rose-950/60 text-rose-300 font-bold',
   },
+  blocked_tool_retry_ceiling: {
+    label: 'RETRY CEILING',
+    className: 'border-amber-500/80 bg-amber-950/60 text-amber-300 font-bold',
+  },
+  blocked_stagnation: {
+    label: 'STAGNATION',
+    className: 'border-purple-500/80 bg-purple-950/60 text-purple-300 font-bold',
+  },
+  blocked_secret_leak: {
+    label: 'SECRET BLOCKED',
+    className: 'border-red-600/80 bg-red-950/70 text-red-300 font-bold',
+  },
+  blocked_stream_loop: {
+    label: 'STREAM ABORT',
+    className: 'border-rose-500/80 bg-rose-950/60 text-rose-300 font-bold',
+  },
+  blocked_session_budget: {
+    label: 'SESSION BUDGET',
+    className: 'border-cyan-500/80 bg-cyan-950/60 text-cyan-300 font-bold',
+  },
   blocked_burn_rate: {
     label: '429 BURN RATE SPIKE',
     className: 'border-amber-500/80 bg-amber-950/60 text-amber-300 font-bold',

@@ -1,19 +1,3 @@
-"""Zero-friction Python SDK for TokenGuard LLM call protection.
-
-Allows developers to protect LLM calls directly in Python via decorators and context managers.
-
-Usage examples:
-    # 1. Function Decorator (Sync or Async)
-    @tokenguard.protect(max_repeats=3, budget_limit=10.0)
-    def ask_agent(prompt: str):
-        client = openai.OpenAI()
-        return client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}])
-
-    # 2. Context Manager
-    with tokenguard.guard(max_repeats=2):
-        response = client.chat.completions.create(...)
-"""
-
 from __future__ import annotations
 
 import functools

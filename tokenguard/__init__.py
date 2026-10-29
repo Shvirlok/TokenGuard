@@ -17,7 +17,7 @@ from tokenguard.guard import (
 from tokenguard.proxy import create_app
 from tokenguard.sdk import guard, protect
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __all__ = [
     "guard",
     "protect",

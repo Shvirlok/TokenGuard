@@ -63,17 +63,22 @@ export function ConfigDialog({ open, onOpenChange }: DialogProps) {
   const { stats } = useTokenGuard()
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Guard limits</DialogTitle>
-          <DialogDescription>Fine-tune the active profile. Changes apply to the running proxy instantly.</DialogDescription>
+          <DialogDescription>Fine-tune the active profile and circuit breakers. Changes apply to the running proxy instantly.</DialogDescription>
         </DialogHeader>
         {stats && open && (
           <ConfigForm
-            key={`${stats.hourly_limit}-${stats.daily_limit}-${stats.loop_threshold}`}
+            key={`${stats.hourly_limit}-${stats.daily_limit}-${stats.session_limit}-${stats.loop_threshold}-${stats.max_tool_repeats}-${stats.max_stagnant_steps}`}
             hourly={stats.hourly_limit}
             daily={stats.daily_limit}
+            sessionLimit={stats.session_limit ?? 0}
             loop={stats.loop_threshold}
+            maxToolRepeats={stats.max_tool_repeats ?? 3}
+            maxStagnantSteps={stats.max_stagnant_steps ?? 6}
+            blockSecrets={Boolean(stats.block_secrets)}
+            redactSecrets={Boolean(stats.redact_secrets)}
             onDone={() => onOpenChange(false)}
           />
         )}
@@ -82,53 +87,107 @@ export function ConfigDialog({ open, onOpenChange }: DialogProps) {
   )
 }
 
-function ConfigForm({ hourly, daily, loop, onDone }: { hourly: number; daily: number; loop: number; onDone: () => void }) {
+function ConfigForm({
+  hourly,
+  daily,
+  sessionLimit,
+  loop,
+  maxToolRepeats,
+  maxStagnantSteps,
+  blockSecrets,
+  redactSecrets,
+  onDone,
+}: {
+  hourly: number
+  daily: number
+  sessionLimit: number
+  loop: number
+  maxToolRepeats: number
+  maxStagnantSteps: number
+  blockSecrets: boolean
+  redactSecrets: boolean
+  onDone: () => void
+}) {
   const { updateLimits, pending } = useTokenGuard()
   const fields = [
     { name: 'hourly_limit', label: 'Hourly budget (USD)', value: hourly, step: '0.01', hint: 'Requests are blocked once the rolling hour exceeds this.' },
     { name: 'daily_limit', label: 'Daily budget (USD)', value: daily, step: '0.01', hint: 'Hard ceiling across a rolling 24h window.' },
+    { name: 'session_limit', label: 'Session limit (USD)', value: sessionLimit, step: '0.01', hint: 'Per-agent session limit in USD (0 = disabled).' },
     { name: 'loop_threshold', label: 'Loop threshold', value: loop, step: '1', hint: 'Identical calls before blocking. 0 disables loop blocking.' },
+    { name: 'max_tool_repeats', label: 'Max tool repeats', value: maxToolRepeats, step: '1', hint: 'Per-tool retry ceiling ignoring mutated arguments.' },
+    { name: 'max_stagnant_steps', label: 'Max stagnant steps', value: maxStagnantSteps, step: '1', hint: 'Consecutive read-only steps without progress before blocking.' },
   ]
 
   return (
     <form
-      className="flex flex-col gap-4"
+      className="flex flex-col gap-4 font-mono"
       onSubmit={async (e) => {
         e.preventDefault()
         const data = new FormData(e.currentTarget)
         const ok = await updateLimits({
           hourly_limit: Number(data.get('hourly_limit')),
           daily_limit: Number(data.get('daily_limit')),
+          session_limit: Number(data.get('session_limit')),
           loop_threshold: Math.round(Number(data.get('loop_threshold'))),
+          max_tool_repeats: Math.round(Number(data.get('max_tool_repeats'))),
+          max_stagnant_steps: Math.round(Number(data.get('max_stagnant_steps'))),
+          block_secrets: Boolean(data.get('block_secrets')),
+          redact_secrets: Boolean(data.get('redact_secrets')),
         })
         if (ok) onDone()
       }}
     >
-      {fields.map((f) => (
-        <div key={f.name} className="flex flex-col gap-1.5">
-          <label htmlFor={f.name} className="text-sm font-medium">
-            {f.label}
-          </label>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {fields.map((f) => (
+          <div key={f.name} className="flex flex-col gap-1.5">
+            <label htmlFor={f.name} className="text-xs font-medium uppercase tracking-wider text-zinc-300">
+              {f.label}
+            </label>
+            <input
+              id={f.name}
+              name={f.name}
+              type="number"
+              min={0}
+              step={f.step}
+              required
+              defaultValue={f.value}
+              className="h-9 rounded-lg border border-[#27272a] bg-[#141416] px-3 font-mono text-xs text-zinc-100 outline-none focus-visible:border-primary"
+            />
+            <p className="text-[10px] text-zinc-500">{f.hint}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex flex-col gap-2 rounded-lg border border-[#27272a] bg-[#101012] p-3">
+        <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
           <input
-            id={f.name}
-            name={f.name}
-            type="number"
-            min={0}
-            step={f.step}
-            required
-            defaultValue={f.value}
-            className="h-10 rounded-xl border bg-background px-3 font-mono text-sm outline-none focus-visible:border-primary"
+            type="checkbox"
+            name="block_secrets"
+            defaultChecked={blockSecrets}
+            className="rounded border-[#27272a] bg-[#18181b] text-primary focus:ring-0"
           />
-          <p className="text-xs text-muted-foreground">{f.hint}</p>
-        </div>
-      ))}
+          <span className="font-semibold uppercase tracking-wider text-red-400">Block Secrets (DLP)</span>
+          <span className="text-[10px] text-zinc-500">— Reject requests containing unredacted API keys</span>
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            name="redact_secrets"
+            defaultChecked={redactSecrets}
+            className="rounded border-[#27272a] bg-[#18181b] text-primary focus:ring-0"
+          />
+          <span className="font-semibold uppercase tracking-wider text-amber-400">Redact Secrets</span>
+          <span className="text-[10px] text-zinc-500">— In-flight masking before upstream forwarding</span>
+        </label>
+      </div>
+
       <DialogFooter>
         <button
           type="submit"
           disabled={pending === 'config'}
-          className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-primary px-4 text-sm font-semibold text-primary-foreground hover:bg-primary/85 disabled:opacity-60"
+          className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary/85 disabled:opacity-60 cursor-pointer"
         >
-          {pending === 'config' && <Loader2 className="size-4 animate-spin" aria-hidden="true" />}
+          {pending === 'config' && <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />}
           Save limits
         </button>
       </DialogFooter>

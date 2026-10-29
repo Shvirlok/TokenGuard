@@ -428,6 +428,11 @@ def test_cli_menu_and_simulate_parsers():
     assert parser.parse_args(["dashboard"]).command == "dashboard"
     assert parser.parse_args(["simulate", "--type", "loop"]).command == "simulate"
     assert parser.parse_args(["simulate", "--type", "alternating_loop"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "drift"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "stagnation"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "secret"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "stream-loop"]).command == "simulate"
+    assert parser.parse_args(["simulate", "--type", "stream_loop"]).command == "simulate"
 
 
 def test_cli_passive_flag(monkeypatch):
@@ -596,5 +601,203 @@ def test_cli_dry_run_flags(monkeypatch):
     pid = start_daemon(port=8080, dry_run=True)
     assert pid == 77777
     assert "--dry-run" in spawned_cmds[0]
+
+
+def test_cli_cmd_simulate_drift_local(monkeypatch):
+    """Verify cmd_simulate with drift runs local in-process simulation when daemon is offline."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "drift"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_stagnation_local(monkeypatch):
+    """Verify cmd_simulate with stagnation runs local in-process simulation when daemon is offline."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "stagnation"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_secret_local(monkeypatch):
+    """Verify cmd_simulate with secret runs local in-process simulation when daemon is offline."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "secret"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_stream_loop_local(monkeypatch):
+    """Verify cmd_simulate with stream-loop runs local in-process simulation when daemon is offline."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "stream-loop"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: False)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_drift_with_server(monkeypatch):
+    """Verify cmd_simulate with drift contacts server when daemon is running."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "drift"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
+
+    sim_payload = {
+        "simulation": "drift",
+        "tripped": True,
+        "tool": "read_file",
+        "threshold": 3,
+        "results": [
+            {"attempt": 1, "tool": "read_file", "args": {"path": "config.json"}, "status": "allowed"},
+            {"attempt": 2, "tool": "read_file", "args": {"path": "./config.json"}, "status": "allowed"},
+            {"attempt": 3, "tool": "read_file", "args": {"path": "/app/config.json"}, "status": "blocked_tool_retry_ceiling"},
+        ],
+        "details": {"reason": "ToolRetryCeilingTripped", "message": "ToolRetryCeilingTripped: read_file called 3 times consecutively", "usd_saved": 0.0125},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = sim_payload
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, **kwargs):
+            return mock_resp
+
+    monkeypatch.setattr(httpx, "Client", MockClient)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_stagnation_with_server(monkeypatch):
+    """Verify cmd_simulate with stagnation contacts server when daemon is running."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "stagnation"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
+
+    sim_payload = {
+        "simulation": "stagnation",
+        "tripped": True,
+        "threshold": 6,
+        "results": [
+            {"attempt": 1, "tool": "read_file", "args": {"step": 1}, "status": "allowed"},
+            {"attempt": 2, "tool": "list_dir", "args": {"step": 2}, "status": "allowed"},
+            {"attempt": 3, "tool": "get_status", "args": {"step": 3}, "status": "allowed"},
+            {"attempt": 4, "tool": "read_file", "args": {"step": 4}, "status": "allowed"},
+            {"attempt": 5, "tool": "search_files", "args": {"step": 5}, "status": "allowed"},
+            {"attempt": 6, "tool": "read_file", "args": {"step": 6}, "status": "blocked_stagnation"},
+        ],
+        "details": {"reason": "SessionStagnationTripped", "message": "SessionStagnationTripped: 6 steps without state change", "usd_saved": 0.0180},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = sim_payload
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, **kwargs):
+            return mock_resp
+
+    monkeypatch.setattr(httpx, "Client", MockClient)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_secret_with_server(monkeypatch):
+    """Verify cmd_simulate with secret contacts server when daemon is running."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "secret"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
+
+    sim_payload = {
+        "simulation": "secret",
+        "tripped": True,
+        "secret_type": "openai_proj_key",
+        "preview": "sk-proj-****************",
+        "results": [
+            {"attempt": 1, "pattern": "openai_proj_key", "payload_snippet": "Deploy with API key sk-proj-****************", "status": "blocked_secret_leak"}
+        ],
+        "details": {"reason": "SecretLeakDetected", "message": "SecretLeakDetected: Found matching pattern openai_proj_key"},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = sim_payload
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, **kwargs):
+            return mock_resp
+
+    monkeypatch.setattr(httpx, "Client", MockClient)
+    cmd_simulate(args)
+
+
+def test_cli_cmd_simulate_stream_loop_with_server(monkeypatch):
+    """Verify cmd_simulate with stream-loop contacts server when daemon is running."""
+    from tokenguard.cli import cmd_simulate, create_parser
+    parser = create_parser()
+    args = parser.parse_args(["simulate", "--type", "stream_loop"])
+
+    monkeypatch.setattr(cli_module, "is_server_running", lambda h, p: True)
+
+    sim_payload = {
+        "simulation": "stream_loop",
+        "tripped": True,
+        "repeated_token": "repeat ",
+        "results": [
+            {"attempt": 1, "token": "repeat ", "repeat_count": 1, "status": "allowed"},
+            {"attempt": 2, "token": "repeat ", "repeat_count": 2, "status": "allowed"},
+            {"attempt": 3, "token": "repeat ", "repeat_count": 3, "status": "allowed"},
+            {"attempt": 4, "token": "repeat ", "repeat_count": 4, "status": "allowed"},
+            {"attempt": 5, "token": "repeat ", "repeat_count": 5, "status": "blocked_stream_loop"},
+        ],
+        "details": {"reason": "StreamLoopAborted", "message": "StreamLoopAborted: repetitive token sequence 'repeat '", "usd_saved": 0.0420},
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = sim_payload
+
+    class MockClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post(self, url, **kwargs):
+            return mock_resp
+
+    monkeypatch.setattr(httpx, "Client", MockClient)
+    cmd_simulate(args)
+
 
 

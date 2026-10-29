@@ -49,7 +49,9 @@ from tokenguard.guard import (
     LoopDetectedError,
     SecretLeakError,
     SessionBudgetLimitError,
+    SessionStagnationError,
     ToolPingPongError,
+    ToolRetryCeilingError,
     parse_burn_rate,
     redact_secrets_in_obj,
     scan_secrets_in_obj,
@@ -830,6 +832,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             **metrics,
             **cb_state,
             "prices_count": len(circuit_breaker.prices),
+            "block_secrets": current_settings.block_secrets,
+            "redact_secrets": current_settings.redact_secrets,
         }
 
     @app.get("/api/requests")
@@ -992,17 +996,26 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         hourly_limit = payload.get("hourly_limit")
         daily_limit = payload.get("daily_limit")
+        session_limit = payload.get("session_limit")
         loop_threshold = payload.get("loop_threshold")
         max_tool_repeats = payload.get("max_tool_repeats")
         max_stagnant_steps = payload.get("max_stagnant_steps")
         profile = payload.get("profile")
         max_burn_rate = payload.get("max_burn_rate")
         enable_context_ballooning = payload.get("enable_context_ballooning")
+        block_secrets = payload.get("block_secrets")
+        redact_secrets = payload.get("redact_secrets")
         source = payload.get("source", "web")
+
+        if block_secrets is not None:
+            current_settings.block_secrets = bool(block_secrets)
+        if redact_secrets is not None:
+            current_settings.redact_secrets = bool(redact_secrets)
 
         circuit_breaker.update_limits(
             hourly_limit=hourly_limit,
             daily_limit=daily_limit,
+            session_limit=session_limit,
             loop_threshold=loop_threshold,
             max_tool_repeats=max_tool_repeats,
             max_stagnant_steps=max_stagnant_steps,
@@ -1276,6 +1289,188 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 blocked_reason="TokenGuard: budget limit exceeded",
             )
             return {"simulation": "budget", "status": "blocked_budget"}
+
+        elif sim_type == "drift":
+            sim_session = f"sim_drift_{int(time.time() * 1000)}"
+            paths = ["config.json", "./config.json", "/app/config.json", "/etc/config.json"]
+            results = []
+            tripped = False
+            trip_info = {}
+            for i in range(1, circuit_breaker.max_tool_repeats + 1):
+                p = paths[(i - 1) % len(paths)]
+                tool_args = {"path": p}
+                try:
+                    circuit_breaker.check_tool_retry_ceiling(sim_session, "read_file")
+                    circuit_breaker.record_tool_name(sim_session, "read_file")
+                    circuit_breaker.record_tool_call(sim_session, "read_file", tool_args)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=120,
+                        completion_tokens=40,
+                        cost_usd=0.0005,
+                        latency_ms=110 + i * 20,
+                        prompt_hash=f"sim_drift_{i}",
+                        status="success",
+                        session_id=sim_session,
+                    )
+                    results.append({"attempt": i, "tool": "read_file", "args": tool_args, "status": "allowed"})
+                except ToolRetryCeilingError as err:
+                    tripped = True
+                    trip_info = {
+                        "reason": "ToolRetryCeilingTripped",
+                        "message": err.message,
+                        "usd_saved": 0.0125,
+                    }
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=120,
+                        completion_tokens=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=f"sim_drift_{i}",
+                        status="blocked_tool_retry_ceiling",
+                        blocked_reason=err.message,
+                        session_id=sim_session,
+                    )
+                    results.append({"attempt": i, "tool": "read_file", "args": tool_args, "status": "blocked_tool_retry_ceiling"})
+                    break
+            return {
+                "simulation": "drift",
+                "tripped": tripped,
+                "tool": "read_file",
+                "threshold": circuit_breaker.max_tool_repeats,
+                "results": results,
+                "details": trip_info,
+            }
+
+        elif sim_type == "stagnation":
+            sim_session = f"sim_stag_{int(time.time() * 1000)}"
+            tools = ["read_file", "list_dir", "get_status", "read_file", "search_files", "read_file", "inspect_env"]
+            results = []
+            tripped = False
+            trip_info = {}
+            for i in range(1, circuit_breaker.max_stagnant_steps + 1):
+                tool_name = tools[(i - 1) % len(tools)]
+                tool_args = {"step": i}
+                try:
+                    circuit_breaker.check_stagnation(sim_session, tool_names=[tool_name])
+                    circuit_breaker.record_stagnation_step(sim_session, tool_names=[tool_name])
+                    circuit_breaker.record_tool_call(sim_session, tool_name, tool_args)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=90,
+                        completion_tokens=35,
+                        cost_usd=0.0004,
+                        latency_ms=90 + i * 15,
+                        prompt_hash=f"sim_stag_{i}",
+                        status="success",
+                        session_id=sim_session,
+                    )
+                    results.append({"attempt": i, "tool": tool_name, "args": tool_args, "status": "allowed"})
+                except SessionStagnationError as err:
+                    tripped = True
+                    trip_info = {
+                        "reason": "SessionStagnationTripped",
+                        "message": err.message,
+                        "usd_saved": 0.0180,
+                    }
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=90,
+                        completion_tokens=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=f"sim_stag_{i}",
+                        status="blocked_stagnation",
+                        blocked_reason=err.message,
+                        session_id=sim_session,
+                    )
+                    results.append({"attempt": i, "tool": tool_name, "args": tool_args, "status": "blocked_stagnation"})
+                    break
+            return {
+                "simulation": "stagnation",
+                "tripped": tripped,
+                "threshold": circuit_breaker.max_stagnant_steps,
+                "results": results,
+                "details": trip_info,
+            }
+
+        elif sim_type == "secret":
+            raw_secret = "sk-proj-abc1234567890123456789012345678901234567890"
+            payload_data = {"role": "user", "content": f"Deploy with API key {raw_secret}"}
+            detected = scan_secrets_in_obj(payload_data) or "openai_proj_key"
+            err_msg = f"SecretLeakDetected: Found matching pattern {detected}"
+            await _record_and_broadcast_request(
+                db_path=current_settings.db_path,
+                model=model,
+                prompt_tokens=50,
+                completion_tokens=0,
+                cost_usd=0.0,
+                latency_ms=0,
+                prompt_hash=f"sim_secret_{int(time.time() * 1000)}",
+                status="blocked_secret_leak",
+                blocked_reason=err_msg,
+            )
+            return {
+                "simulation": "secret",
+                "tripped": True,
+                "secret_type": detected,
+                "preview": f"sk-proj-{'*' * 16}",
+                "results": [
+                    {
+                        "attempt": 1,
+                        "pattern": detected,
+                        "payload_snippet": f"Deploy with API key sk-proj-{'*' * 16}",
+                        "status": "blocked_secret_leak",
+                    }
+                ],
+                "details": {
+                    "reason": "SecretLeakDetected",
+                    "message": err_msg,
+                },
+            }
+
+        elif sim_type in ("stream_loop", "stream-loop"):
+            detector = StreamLoopDetector(max_repeats=5)
+            token = "repeat "
+            results = []
+            tripped = False
+            trip_info = {}
+            for i in range(1, 6):
+                detector.feed_text(token)
+                if detector.loop_detected:
+                    tripped = True
+                    trip_info = {
+                        "reason": "StreamLoopAborted",
+                        "message": f"StreamLoopAborted: repetitive token sequence '{token}'",
+                        "usd_saved": 0.0420,
+                    }
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=40,
+                        completion_tokens=15,
+                        cost_usd=0.0002,
+                        latency_ms=250,
+                        prompt_hash=f"sim_stream_{int(time.time() * 1000)}",
+                        status="blocked_stream_loop",
+                        blocked_reason=trip_info["message"],
+                    )
+                    results.append({"attempt": i, "token": token, "repeat_count": i, "status": "blocked_stream_loop"})
+                    break
+                else:
+                    results.append({"attempt": i, "token": token, "repeat_count": i, "status": "allowed"})
+            return {
+                "simulation": "stream_loop",
+                "tripped": tripped,
+                "repeated_token": token,
+                "results": results,
+                "details": trip_info,
+            }
 
         return {"status": "unknown simulation type"}
 

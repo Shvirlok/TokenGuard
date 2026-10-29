@@ -26,9 +26,16 @@ export function DashboardHeader({ onOpenConfig }: DashboardHeaderProps) {
           </div>
           <span className="text-xs font-bold tracking-tight text-zinc-100 uppercase">TokenGuard</span>
           <span className="rounded border border-[#27272a] bg-[#18181b] px-1.5 py-0.5 text-[10px] text-zinc-400">
-            v0.2.0
+            v0.2.3
           </span>
         </div>
+
+        {stats?.dry_run && (
+          <span className="inline-flex items-center gap-1.5 rounded border border-amber-500/60 bg-amber-950/40 px-2 py-0.5 text-[10px] font-semibold tracking-wider text-amber-300 animate-pulse uppercase">
+            <span className="size-1.5 rounded-full bg-amber-400" />
+            SHADOW / DRY-RUN ACTIVE
+          </span>
+        )}
 
         <div className="h-3.5 w-px bg-[#27272a]" />
 

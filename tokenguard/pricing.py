@@ -1,5 +1,3 @@
-"""Dynamic pricing engine for TokenGuard with offline-first OpenRouter registry sync."""
-
 from __future__ import annotations
 
 import json

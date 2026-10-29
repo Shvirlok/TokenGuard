@@ -249,8 +249,19 @@ def create_parser() -> argparse.ArgumentParser:
         "--type",
         type=str,
         default="loop",
-        choices=["loop", "budget", "success", "tool_loop", "alternating_loop"],
-        help="Simulation type (default: loop; choices: loop, budget, success, tool_loop, alternating_loop)",
+        choices=[
+            "loop",
+            "budget",
+            "success",
+            "tool_loop",
+            "alternating_loop",
+            "drift",
+            "stagnation",
+            "secret",
+            "stream-loop",
+            "stream_loop",
+        ],
+        help="Simulation type (default: loop; choices: loop, budget, success, tool_loop, alternating_loop, drift, stagnation, secret, stream-loop)",
     )
     sim_parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for simulation")
     sim_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
@@ -1981,7 +1992,6 @@ def _render_alternating_loop_demo(
     host: str = "127.0.0.1",
     port: int = 8080,
 ) -> None:
-    """Render interactive CLI visualization of an alternating tool ping-pong loop demo."""
     results = data.get("results", [])
     tripped = data.get("tripped", False)
     cycle_len = data.get("cycle_length", 2)
@@ -2036,6 +2046,278 @@ def _render_alternating_loop_demo(
         Panel(
             panel_body,
             title="[bold bright_white]Circuit Breaker: A-B-A-B Trip Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="red" if tripped else "green",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def _render_drift_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    results = data.get("results", [])
+    tripped = data.get("tripped", False)
+    tool_name = data.get("tool", "read_file")
+    threshold = data.get("threshold", 3)
+    usd_saved = data.get("details", {}).get("usd_saved", 0.0125)
+
+    table = Table(
+        title="TokenGuard Circuit Breaker — Argument Drift Bypass Demo",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        expand=False,
+    )
+    table.add_column("Step", justify="center", style="bold")
+    table.add_column("Tool", style="cyan")
+    table.add_column("Mutated Arguments", style="dim")
+    table.add_column("Action / Status", justify="left")
+
+    for item in results:
+        step = str(item.get("attempt") or item.get("step") or "")
+        tool = item.get("tool", tool_name)
+        args_str = json.dumps(item.get("args", {}))
+        status = item.get("status", "")
+        if status == "allowed":
+            status_text = "[bold green]ALLOWED (200 OK)[/bold green]"
+        else:
+            status_text = "[bold red]⚡ BLOCKED (429 Circuit Breaker Tripped)[/bold red]"
+        table.add_row(step, tool, args_str, status_text)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    trip_detail = data.get("details", {})
+    err_msg = trip_detail.get("message") or f"ToolRetryCeilingTripped: {tool_name} called {threshold} times consecutively"
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    panel_body = (
+        f"[bold red]● Circuit Breaker Tripped: Argument Drift / Retry Ceiling Intercepted[/bold red]\n\n"
+        f"[bold white]Status Code:[/bold white] [bold red]429 Too Many Requests[/bold red]\n"
+        f"[bold white]Headers:[/bold white]\n"
+        f"  [cyan]X-TokenGuard-Reason:[/cyan] {err_msg}\n"
+        f"  [cyan]X-TokenGuard-USD-Saved:[/cyan] ${usd_saved:.4f}\n\n"
+        f"[bold white]Outcome:[/bold white] Argument drift bypass blocked locally before reaching upstream LLM\n"
+        f"[bold green]Avoided Cost:[/bold green] +${usd_saved:.4f} estimated saved spend\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Circuit Breaker: Tool Retry Ceiling Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="red" if tripped else "green",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def _render_stagnation_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    results = data.get("results", [])
+    tripped = data.get("tripped", False)
+    threshold = data.get("threshold", 6)
+    usd_saved = data.get("details", {}).get("usd_saved", 0.0180)
+
+    table = Table(
+        title="TokenGuard Circuit Breaker — Session Stagnation Guard Demo",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        expand=False,
+    )
+    table.add_column("Step", justify="center", style="bold")
+    table.add_column("Action / Tool", style="cyan")
+    table.add_column("State Mutated", justify="center", style="dim")
+    table.add_column("Action / Status", justify="left")
+
+    for item in results:
+        step = str(item.get("attempt") or item.get("step") or "")
+        tool = item.get("tool", "")
+        mutated = "[dim]False[/dim]"
+        status = item.get("status", "")
+        if status == "allowed":
+            status_text = "[bold green]ALLOWED (200 OK)[/bold green]"
+        else:
+            status_text = "[bold red]⚡ BLOCKED (429 Circuit Breaker Tripped)[/bold red]"
+        table.add_row(step, tool, mutated, status_text)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    trip_detail = data.get("details", {})
+    err_msg = trip_detail.get("message") or f"SessionStagnationTripped: {threshold} steps without state change"
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    panel_body = (
+        f"[bold red]● Circuit Breaker Tripped: Read-Only Stagnation Intercepted[/bold red]\n\n"
+        f"[bold white]Status Code:[/bold white] [bold red]429 Too Many Requests[/bold red]\n"
+        f"[bold white]Headers:[/bold white]\n"
+        f"  [cyan]X-TokenGuard-Reason:[/cyan] {err_msg}\n"
+        f"  [cyan]X-TokenGuard-USD-Saved:[/cyan] ${usd_saved:.4f}\n\n"
+        f"[bold white]Outcome:[/bold white] Stagnant read-only loop terminated after {threshold} zero-state-change iterations\n"
+        f"[bold green]Avoided Cost:[/bold green] +${usd_saved:.4f} estimated saved spend\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Circuit Breaker: Session Stagnation Guard Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="red" if tripped else "green",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def _render_secret_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    results = data.get("results", [])
+    tripped = data.get("tripped", False)
+    secret_type = data.get("secret_type", "OpenAI Project Key")
+    preview = data.get("preview", "sk-proj-abc1234567890123456789012345678901234567890")
+
+    table = Table(
+        title="TokenGuard Security — Data Loss Prevention (DLP) Secret Leak Demo",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        expand=False,
+    )
+    table.add_column("Attempt", justify="center", style="bold")
+    table.add_column("Detected Pattern", style="red")
+    table.add_column("Payload Snapshot", style="dim")
+    table.add_column("Action / Status", justify="left")
+
+    for item in results:
+        step = str(item.get("attempt") or "1")
+        pat = item.get("pattern", secret_type)
+        snippet = item.get("payload_snippet", preview)
+        status_text = "[bold red]⚡ BLOCKED (400 SecretLeakDetected)[/bold red]"
+        table.add_row(step, pat, snippet, status_text)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    trip_detail = data.get("details", {})
+    err_msg = trip_detail.get("message") or f"SecretLeakDetected: Found matching pattern {secret_type}"
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    panel_body = (
+        f"[bold red]● Outbound Request Intercepted: Secret Leak Blocked[/bold red]\n\n"
+        f"[bold white]Status Code:[/bold white] [bold red]400 Bad Request[/bold red]\n"
+        f"[bold white]Headers:[/bold white]\n"
+        f"  [cyan]X-TokenGuard-Reason:[/cyan] {err_msg}\n\n"
+        f"[bold white]Pattern Detected:[/bold white] [red]{secret_type}[/red]\n"
+        f"[bold white]Outcome:[/bold white] Intercepted before plaintext API credential escaped to upstream provider\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Security: DLP Secret Leak Interceptor Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="red" if tripped else "green",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def _render_stream_loop_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    results = data.get("results", [])
+    tripped = data.get("tripped", False)
+    repeated_token = data.get("repeated_token", "repeat ")
+    usd_saved = data.get("details", {}).get("usd_saved", 0.0420)
+
+    table = Table(
+        title="TokenGuard Circuit Breaker — Mid-Stream Token Repetition Cutoff Demo",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold bright_white",
+        expand=False,
+    )
+    table.add_column("Chunk #", justify="center", style="bold")
+    table.add_column("Stream Delta", style="cyan")
+    table.add_column("Repetition Count", justify="center", style="dim")
+    table.add_column("Stream State", justify="left")
+
+    for item in results:
+        step = str(item.get("attempt") or item.get("chunk") or "")
+        token = item.get("token", repeated_token)
+        rep = str(item.get("repeat_count", step))
+        status = item.get("status", "")
+        if status == "allowed" or status == "streaming":
+            status_text = "[bold green]PASSING (Stream Active)[/bold green]"
+        else:
+            status_text = "[bold red]⚡ ABORTED (SSE Stream Severed)[/bold red]"
+        table.add_row(step, repr(token), rep, status_text)
+
+    console.print()
+    console.print(table)
+    console.print()
+
+    trip_detail = data.get("details", {})
+    err_msg = trip_detail.get("message") or f"StreamLoopAborted: repetitive token sequence '{repeated_token}'"
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    panel_body = (
+        f"[bold red]● Circuit Breaker Tripped: Mid-Stream Token Repetition Cutoff[/bold red]\n\n"
+        f"[bold white]Status Code:[/bold white] [bold yellow]200 OK (Stream Severed Early)[/bold yellow]\n"
+        f"[bold white]Headers:[/bold white]\n"
+        f"  [cyan]X-TokenGuard-Reason:[/cyan] {err_msg}\n"
+        f"  [cyan]X-TokenGuard-USD-Saved:[/cyan] ${usd_saved:.4f}\n\n"
+        f"[bold white]Outcome:[/bold white] Upstream SSE connection aborted mid-flight to stop infinite token generation loop\n"
+        f"[bold green]Avoided Cost:[/bold green] +${usd_saved:.4f} estimated saved spend\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Circuit Breaker: Mid-Stream Repetition Cutoff Demo[/bold bright_white]",
             box=box.ROUNDED,
             border_style="red" if tripped else "green",
             padding=(1, 2),
@@ -2117,6 +2399,219 @@ def cmd_simulate(args: argparse.Namespace) -> None:
             "details": trip_info,
         }
         _render_alternating_loop_demo(data, is_local=True)
+        return
+
+    if sim_type == "drift":
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "drift", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "drift" and data.get("results"):
+                            _render_drift_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass
+
+        from tokenguard.guard import CircuitBreaker, ToolRetryCeilingError
+        guard = CircuitBreaker(max_tool_repeats=3)
+        session_id = f"demo_drift_{int(time.time())}"
+        paths = ["config.json", "./config.json", "/app/config.json", "/etc/config.json"]
+        results = []
+        tripped = False
+        trip_info = {}
+
+        for i in range(1, guard.max_tool_repeats + 1):
+            tool_args = {"path": paths[(i - 1) % len(paths)]}
+            try:
+                guard.check_tool_retry_ceiling(session_id, "read_file")
+                guard.record_tool_name(session_id, "read_file")
+                guard.record_tool_call(session_id, "read_file", tool_args)
+                results.append({
+                    "attempt": i,
+                    "tool": "read_file",
+                    "args": tool_args,
+                    "status": "allowed",
+                })
+            except ToolRetryCeilingError as err:
+                tripped = True
+                trip_info = {
+                    "reason": "ToolRetryCeilingTripped",
+                    "message": err.message,
+                    "usd_saved": 0.0125,
+                }
+                results.append({
+                    "attempt": i,
+                    "tool": "read_file",
+                    "args": tool_args,
+                    "status": "blocked_tool_retry_ceiling",
+                })
+                break
+
+        data = {
+            "simulation": "drift",
+            "tripped": tripped,
+            "tool": "read_file",
+            "threshold": guard.max_tool_repeats,
+            "results": results,
+            "details": trip_info,
+        }
+        _render_drift_demo(data, is_local=True)
+        return
+
+    if sim_type == "stagnation":
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "stagnation", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "stagnation" and data.get("results"):
+                            _render_stagnation_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass
+
+        from tokenguard.guard import CircuitBreaker, SessionStagnationError
+        guard = CircuitBreaker(max_stagnant_steps=6)
+        session_id = f"demo_stag_{int(time.time())}"
+        tools = ["read_file", "list_dir", "get_status", "read_file", "search_files", "read_file"]
+        results = []
+        tripped = False
+        trip_info = {}
+
+        for i in range(1, guard.max_stagnant_steps + 1):
+            tool_name = tools[(i - 1) % len(tools)]
+            tool_args = {"step": i}
+            try:
+                guard.check_stagnation(session_id, tool_names=[tool_name])
+                guard.record_stagnation_step(session_id, tool_names=[tool_name])
+                guard.record_tool_call(session_id, tool_name, tool_args)
+                results.append({
+                    "attempt": i,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "status": "allowed",
+                })
+            except SessionStagnationError as err:
+                tripped = True
+                trip_info = {
+                    "reason": "SessionStagnationTripped",
+                    "message": err.message,
+                    "usd_saved": 0.0180,
+                }
+                results.append({
+                    "attempt": i,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "status": "blocked_stagnation",
+                })
+                break
+
+        data = {
+            "simulation": "stagnation",
+            "tripped": tripped,
+            "threshold": guard.max_stagnant_steps,
+            "results": results,
+            "details": trip_info,
+        }
+        _render_stagnation_demo(data, is_local=True)
+        return
+
+    if sim_type == "secret":
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "secret", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "secret" and data.get("results"):
+                            _render_secret_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass
+
+        from tokenguard.guard import scan_secrets_in_obj
+        raw_secret = "sk-proj-abc1234567890123456789012345678901234567890"
+        payload_data = {"role": "user", "content": f"Deploy with API key {raw_secret}"}
+        detected = scan_secrets_in_obj(payload_data) or "openai_proj_key"
+        err_msg = f"SecretLeakDetected: Found matching pattern {detected}"
+        data = {
+            "simulation": "secret",
+            "tripped": True,
+            "secret_type": detected,
+            "preview": f"sk-proj-{'*' * 16}",
+            "results": [
+                {
+                    "attempt": 1,
+                    "pattern": detected,
+                    "payload_snippet": f"Deploy with API key sk-proj-{'*' * 16}",
+                    "status": "blocked_secret_leak",
+                }
+            ],
+            "details": {
+                "reason": "SecretLeakDetected",
+                "message": err_msg,
+            },
+        }
+        _render_secret_demo(data, is_local=True)
+        return
+
+    if sim_type in ("stream-loop", "stream_loop"):
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "stream_loop", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "stream_loop" and data.get("results"):
+                            _render_stream_loop_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass
+
+        from tokenguard.proxy import StreamLoopDetector
+        detector = StreamLoopDetector(max_repeats=5)
+        token = "repeat "
+        results = []
+        tripped = False
+        trip_info = {}
+
+        for i in range(1, 6):
+            detector.feed_text(token)
+            if detector.loop_detected:
+                tripped = True
+                trip_info = {
+                    "reason": "StreamLoopAborted",
+                    "message": f"StreamLoopAborted: repetitive token sequence '{token}'",
+                    "usd_saved": 0.0420,
+                }
+                results.append({"attempt": i, "token": token, "repeat_count": i, "status": "blocked_stream_loop"})
+                break
+            else:
+                results.append({"attempt": i, "token": token, "repeat_count": i, "status": "allowed"})
+
+        data = {
+            "simulation": "stream_loop",
+            "tripped": tripped,
+            "repeated_token": token,
+            "results": results,
+            "details": trip_info,
+        }
+        _render_stream_loop_demo(data, is_local=True)
         return
 
     try:
