@@ -161,6 +161,7 @@ async def get_metrics(
                 COALESCE(SUM(CASE WHEN status = 'blocked_killswitch' THEN 1 ELSE 0 END), 0) AS blocked_killswitch_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_burn_rate' THEN 1 ELSE 0 END), 0) AS blocked_burn_rate_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_context_ballooning' THEN 1 ELSE 0 END), 0) AS blocked_context_ballooning_count,
+                COALESCE(SUM(CASE WHEN status = 'nudged_loop' THEN 1 ELSE 0 END), 0) AS nudged_loop_count,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN cost_usd ELSE 0.0 END), 0.0) AS total_spent,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN prompt_tokens ELSE 0 END), 0) AS total_prompt_tokens,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN completion_tokens ELSE 0 END), 0) AS total_completion_tokens,
@@ -183,6 +184,7 @@ async def get_metrics(
                 COALESCE(SUM(CASE WHEN status = 'blocked_stagnation' THEN 1 ELSE 0 END), 0) AS all_time_blocked_stagnation,
                 COALESCE(SUM(CASE WHEN status = 'blocked_secret_leak' THEN 1 ELSE 0 END), 0) AS all_time_blocked_secret,
                 COALESCE(SUM(CASE WHEN status IN ('blocked_budget', 'blocked_session_budget') THEN 1 ELSE 0 END), 0) AS all_time_blocked_budget,
+                COALESCE(SUM(CASE WHEN status = 'nudged_loop' THEN 1 ELSE 0 END), 0) AS all_time_nudged_loops,
                 COALESCE(SUM(CASE WHEN status LIKE 'blocked%' THEN 1 ELSE 0 END), 0) AS all_time_blocked_total
             FROM requests
         """
@@ -193,7 +195,7 @@ async def get_metrics(
         blocked_rows_query = """
             SELECT model, prompt_tokens, status
             FROM requests
-            WHERE status LIKE 'blocked%'
+            WHERE status LIKE 'blocked%' OR status = 'nudged_loop'
         """
         async with db.execute(blocked_rows_query) as cursor:
             blocked_rows = await cursor.fetchall()
@@ -225,6 +227,7 @@ async def get_metrics(
             "blocked_killswitch_count": window_data.get("blocked_killswitch_count", 0),
             "blocked_burn_rate_count": window_data.get("blocked_burn_rate_count", 0),
             "blocked_context_ballooning_count": window_data.get("blocked_context_ballooning_count", 0),
+            "nudged_loop_count": window_data.get("nudged_loop_count", 0),
             "total_spent": round(window_data.get("total_spent", 0.0), 6),
             "total_prompt_tokens": window_data.get("total_prompt_tokens", 0),
             "total_completion_tokens": window_data.get("total_completion_tokens", 0),
@@ -237,6 +240,7 @@ async def get_metrics(
             "all_time_blocked_stagnation": all_time_data.get("all_time_blocked_stagnation", 0),
             "all_time_blocked_secret": all_time_data.get("all_time_blocked_secret", 0),
             "all_time_blocked_budget": all_time_data.get("all_time_blocked_budget", 0),
+            "all_time_nudged_loops": all_time_data.get("all_time_nudged_loops", 0),
             "all_time_blocked_total": all_time_data.get("all_time_blocked_total", 0),
             "saved_cost_estimate": saved_cost_estimate,
         }
@@ -258,6 +262,17 @@ async def get_recent_requests(
                            session_id
                     FROM requests
                     WHERE status LIKE 'blocked%'
+                    ORDER BY id DESC
+                    LIMIT ? OFFSET ?
+                """
+                params = (limit, offset)
+            elif status_filter == "nudged":
+                query = """
+                    SELECT id, timestamp, model, prompt_tokens, completion_tokens,
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
+                    FROM requests
+                    WHERE status LIKE 'nudged%'
                     ORDER BY id DESC
                     LIMIT ? OFFSET ?
                 """
@@ -382,6 +397,16 @@ async def get_all_requests_for_export(
                     ORDER BY id ASC
                 """
                 params: tuple = ()
+            elif status_filter == "nudged":
+                query = """
+                    SELECT id, timestamp, model, prompt_tokens, completion_tokens,
+                           cost_usd, latency_ms, prompt_hash, status, blocked_reason,
+                           session_id
+                    FROM requests
+                    WHERE status LIKE 'nudged%'
+                    ORDER BY id ASC
+                """
+                params = ()
             else:
                 query = """
                     SELECT id, timestamp, model, prompt_tokens, completion_tokens,

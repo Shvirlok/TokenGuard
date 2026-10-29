@@ -13,11 +13,13 @@ from tokenguard.guard import (
     SessionStagnationError,
     ToolPingPongError,
     ToolRetryCeilingError,
+    build_nudge_message,
+    is_nudgeable_error,
 )
 from tokenguard.proxy import create_app
 from tokenguard.sdk import guard, protect
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 __all__ = [
     "guard",
     "protect",
@@ -37,5 +39,7 @@ __all__ = [
     "SessionBudgetLimitError",
     "KillSwitchActiveError",
     "SecretLeakError",
+    "build_nudge_message",
+    "is_nudgeable_error",
     "create_app",
 ]

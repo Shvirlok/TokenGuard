@@ -251,6 +251,7 @@ class LoopDetectedError(CircuitBreakerError):
         message: str = "TokenGuard: infinite agent loop detected",
         cycle_length: int = 1,
         pattern: Optional[List[str]] = None,
+        repeats: int = 3,
         tokens_saved: Optional[int] = None,
         usd_saved: Optional[float] = None,
     ):
@@ -258,11 +259,13 @@ class LoopDetectedError(CircuitBreakerError):
             message=message,
             error_type="loop_detected",
             status_code=429,
+            repeats=repeats,
             tokens_saved=tokens_saved,
             usd_saved=usd_saved,
         )
         self.cycle_length = cycle_length
         self.pattern = pattern
+        self.repeats = repeats
 
 
 class ToolPingPongError(CircuitBreakerError):
@@ -428,6 +431,49 @@ class KillSwitchActiveError(CircuitBreakerError):
             tokens_saved=tokens_saved,
             usd_saved=usd_saved,
         )
+
+
+def is_nudgeable_error(err: BaseException) -> bool:
+    """Return True if a circuit breaker error is eligible for synthetic 200 OK nudge recovery."""
+    return isinstance(
+        err,
+        (
+            ToolRetryCeilingError,
+            ToolPingPongError,
+            LoopDetectedError,
+            SessionStagnationError,
+        ),
+    )
+
+
+def build_nudge_message(err: CircuitBreakerError) -> str:
+    """Build synthetic assistant recovery guidance message for a tripped loop/stagnation guard."""
+    suffix = (
+        "Do not repeat this action. Summarize your current findings, "
+        "alter your strategy, or ask the user for guidance."
+    )
+    if isinstance(err, (ToolRetryCeilingError, ToolPingPongError)):
+        if isinstance(err, ToolPingPongError) and err.cycle_length > 1 and err.pattern:
+            tool_desc = " -> ".join(err.pattern)
+        else:
+            tool_desc = err.tool_name
+        count = getattr(err, "repeats", 3)
+        return (
+            f"[TokenGuard Alert] Execution loop detected: You have repeated tool call "
+            f"'{tool_desc}' {count} times without state progression. {suffix}"
+        )
+    if isinstance(err, SessionStagnationError):
+        return (
+            f"[TokenGuard Alert] Execution loop detected: You have executed "
+            f"{err.steps} consecutive steps without state progression. {suffix}"
+        )
+    if isinstance(err, LoopDetectedError):
+        count = getattr(err, "repeats", 3)
+        return (
+            f"[TokenGuard Alert] Execution loop detected: You have repeated identical request "
+            f"{count} times without state progression. {suffix}"
+        )
+    return f"[TokenGuard Alert] Execution loop detected: {err.message}. {suffix}"
 
 
 class SessionBudgetLimitError(CircuitBreakerError):
@@ -1302,6 +1348,7 @@ class CircuitBreaker:
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: bool = True,
         dry_run: bool = False,
+        on_trip: str = "block",
         block_secrets: bool = False,
         redact_secrets: bool = False,
         session_limit: float = 0.0,
@@ -1329,6 +1376,10 @@ class CircuitBreaker:
         self.max_burn_rate = max_burn_rate
         self.enable_context_ballooning = enable_context_ballooning
         self.dry_run = dry_run
+        normalized_on_trip = (on_trip or "block").strip().lower()
+        if normalized_on_trip not in ("block", "nudge"):
+            raise ValueError(f"Invalid on_trip mode '{on_trip}'. Expected 'block' or 'nudge'.")
+        self.on_trip = normalized_on_trip
         self.block_secrets = block_secrets
         self.redact_secrets = redact_secrets
         self.session_limit = session_limit
@@ -1372,6 +1423,10 @@ class CircuitBreaker:
             ttl_seconds=session_ttl_seconds,
         )
         self._session_last_seen: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+        )
+        self._session_nudged: ExpiringLRUDict = ExpiringLRUDict(
             max_size=max_active_sessions,
             ttl_seconds=session_ttl_seconds,
         )
@@ -1423,6 +1478,99 @@ class CircuitBreaker:
         """Toggle dry-run / observation mode on the circuit breaker."""
         self.dry_run = bool(enabled)
 
+    def set_on_trip(self, mode: str) -> None:
+        """Set trip handling mode ('block' or 'nudge')."""
+        normalized = (mode or "block").strip().lower()
+        if normalized not in ("block", "nudge"):
+            raise ValueError(f"Invalid on_trip mode '{mode}'. Expected 'block' or 'nudge'.")
+        with self._lock:
+            self.on_trip = normalized
+
+    def evaluate_trip_action(
+        self,
+        session_id: Optional[str],
+        err: CircuitBreakerError,
+        prompt_hash: Optional[str] = None,
+    ) -> str:
+        """Determine whether a tripped circuit should return a synthetic 200 'nudge' or hard 429 'block'.
+
+        Tracks per-session nudge state in LRU-bounded `_session_nudged`.
+        First eligible loop/stagnation trip in a session returns 'nudge';
+        a consecutive violation in the same session escalates to 'block' and clears `_session_nudged`.
+        """
+        with self._lock:
+            sess = session_id or "default"
+            self._touch_session(sess)
+            if not is_nudgeable_error(err):
+                return "block"
+
+            already_nudged = bool(self._session_nudged.get(sess, False))
+            if self.on_trip != "nudge" or already_nudged:
+                self._session_nudged.pop(sess, None)
+                return "block"
+
+            self._session_nudged[sess] = True
+            now = time.time()
+
+            # Preserve pre-trip streak in session memory so that if the agent appends the
+            # synthetic assistant text message and immediately repeats the offending action,
+            # the next turn deterministically trips and escalates to 429.
+            if isinstance(err, ToolRetryCeilingError) and self.max_tool_repeats > 1:
+                prev = self._tool_repeat_state.get(sess)
+                prev_cnt = prev[1] if (prev is not None and prev[0] == err.tool_name) else 0
+                self._tool_repeat_state[sess] = (
+                    err.tool_name,
+                    max(prev_cnt, self.max_tool_repeats - 1),
+                    now,
+                )
+            elif isinstance(err, ToolPingPongError):
+                if err.cycle_length == 1 and self.tool_loop_threshold > 1:
+                    canonical = err.tool_args if err.tool_args is not None else "{}"
+                    hist = self._tool_history[sess]
+                    tail_same = 0
+                    for item in reversed(hist):
+                        if item[1] == err.tool_name and (
+                            item[2] == canonical
+                            or compute_argument_similarity(item[2], canonical) >= 0.90
+                        ):
+                            tail_same += 1
+                        else:
+                            break
+                    while tail_same < self.tool_loop_threshold - 1:
+                        hist.append((now, err.tool_name, canonical))
+                        tail_same += 1
+                if err.cycle_length == 1 and self.max_tool_repeats > 1:
+                    prev = self._tool_repeat_state.get(sess)
+                    prev_cnt = prev[1] if (prev is not None and prev[0] == err.tool_name) else 0
+                    self._tool_repeat_state[sess] = (
+                        err.tool_name,
+                        max(prev_cnt, min(err.repeats - 1, self.max_tool_repeats - 1)),
+                        now,
+                    )
+            elif isinstance(err, SessionStagnationError) and self.max_stagnant_steps > 1:
+                self._stagnant_steps[sess] = max(
+                    self._stagnant_steps.get(sess, 0),
+                    self.max_stagnant_steps - 1,
+                )
+            elif (
+                isinstance(err, LoopDetectedError)
+                and prompt_hash
+                and err.cycle_length == 1
+                and self.loop_threshold > 1
+            ):
+                q = self._session_hashes[sess]
+                tail_same = 0
+                for _, h in reversed(q):
+                    if h == prompt_hash:
+                        tail_same += 1
+                    else:
+                        break
+                while tail_same < self.loop_threshold - 1:
+                    q.append((now, prompt_hash))
+                    tail_same += 1
+
+            return "nudge"
+
     def _touch_session(self, session_id: str) -> None:
         if not session_id:
             return
@@ -1450,6 +1598,7 @@ class CircuitBreaker:
         self._tool_repeat_state.pop(session_id, None)
         self._stagnant_steps.pop(session_id, None)
         self._session_spend.pop(session_id, None)
+        self._session_nudged.pop(session_id, None)
 
     def get_session_spend(self, session_id: str) -> float:
         with self._lock:
@@ -2062,6 +2211,7 @@ class CircuitBreaker:
                 message=msg,
                 repeats=self.tool_loop_threshold if cycle_len == 1 else 2,
                 repeat_count=self.tool_loop_threshold if cycle_len == 1 else 2,
+                tool_args=extracted[-1][1],
                 cycle_length=cycle_len,
                 pattern=pattern,
                 tokens_saved=t_saved,
@@ -2188,6 +2338,8 @@ class CircuitBreaker:
             else:
                 prompt_hash = self.compute_prompt_hash(messages)
             sess = session_id or "default"
+            if has_task_update:
+                self._session_nudged.pop(sess, None)
 
             if self.block_secrets:
                 secret_match = scan_secrets_in_obj(messages)
@@ -2255,6 +2407,7 @@ class CircuitBreaker:
                 raise LoopDetectedError(
                     message=msg,
                     cycle_length=cycle_len,
+                    repeats=self.loop_threshold if cycle_len == 1 else 2,
                     tokens_saved=t_saved,
                     usd_saved=u_saved,
                 )
@@ -2349,6 +2502,7 @@ class CircuitBreaker:
                 "cache_hit": cache_hit,
                 "timestamp": time.time(),
             })
+            self._session_nudged.pop(sess, None)
             return prompt_hash
 
     def record_success(
@@ -2393,6 +2547,7 @@ class CircuitBreaker:
             self._stagnant_steps.clear()
             self._session_spend.clear()
             self._session_last_seen.clear()
+            self._session_nudged.clear()
             self.kill_switch_active = False
 
     def toggle_kill_switch(self, active: Optional[bool] = None) -> bool:
@@ -2416,6 +2571,7 @@ class CircuitBreaker:
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: Optional[bool] = None,
         session_limit: Optional[float] = None,
+        on_trip: Optional[str] = None,
     ) -> None:
         """Dynamically update runtime limits and profile."""
         with self._lock:
@@ -2444,6 +2600,10 @@ class CircuitBreaker:
                     self.burn_rate_limit, self.burn_rate_window_seconds = None, None
             if enable_context_ballooning is not None:
                 self.enable_context_ballooning = bool(enable_context_ballooning)
+            if on_trip is not None:
+                normalized = str(on_trip).strip().lower()
+                if normalized in ("block", "nudge"):
+                    self.on_trip = normalized
 
     def seed_initial_spends(self, spend_entries: List[Tuple[float, float]]) -> None:
         """Seed initial spend entries (e.g. from DB on startup) into in-memory tracker."""
@@ -2467,6 +2627,7 @@ class CircuitBreaker:
             "kill_switch_active": self.kill_switch_active,
             "active_profile": self.active_profile,
             "dry_run": self.dry_run,
+            "on_trip": self.on_trip,
             "hourly_limit": self.hourly_limit,
             "daily_limit": self.daily_limit,
             "session_limit": self.session_limit,

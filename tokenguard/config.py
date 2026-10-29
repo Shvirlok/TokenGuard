@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     max_burn_rate: Optional[str] = Field(default=None, description="Sliding window burn rate limit (e.g. $0.50/min, $2.00/5m)")
     enable_context_ballooning: bool = Field(default=True, description="Enable runaway context ballooning guard")
     dry_run: bool = Field(default=False, description="Observation mode (detect and log trips, but pass requests through upstream)")
+    on_trip: str = Field(default="block", description="Action when loop circuit trips: 'block' (HTTP 429) or 'nudge' (synthetic 200 OK recovery on first violation)")
     max_tool_repeats: int = Field(default=3, description="Maximum consecutive calls per tool name before tripping (0 to disable)")
     max_stagnant_steps: int = Field(default=6, description="Maximum consecutive non-mutating steps without state change before tripping (0 to disable)")
     block_secrets: bool = Field(default=False, description="Abort requests containing detected raw secrets/API keys")
@@ -60,6 +61,9 @@ class Settings(BaseSettings):
     admin_token_required: bool = Field(default=True, description="Enforce X-TokenGuard-Admin-Token on mutating /api/* routes")
 
     def model_post_init(self, __context) -> None:
+        self.on_trip = (self.on_trip or "block").strip().lower()
+        if self.on_trip not in ("block", "nudge"):
+            raise ValueError(f"Invalid on_trip mode '{self.on_trip}'. Expected 'block' or 'nudge'.")
         if self.max_repeats is not None:
             self.loop_threshold = self.max_repeats
         if self.passive or self.profile == "passive":

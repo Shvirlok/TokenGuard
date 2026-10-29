@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
@@ -52,6 +53,8 @@ from tokenguard.guard import (
     SessionStagnationError,
     ToolPingPongError,
     ToolRetryCeilingError,
+    build_nudge_message,
+    is_nudgeable_error,
     parse_burn_rate,
     redact_secrets_in_obj,
     scan_secrets_in_obj,
@@ -368,6 +371,7 @@ def get_guard() -> CircuitBreaker:
             max_burn_rate=settings.max_burn_rate,
             enable_context_ballooning=settings.enable_context_ballooning,
             dry_run=settings.dry_run,
+            on_trip=settings.on_trip,
             block_secrets=settings.block_secrets,
             redact_secrets=settings.redact_secrets,
             session_limit=settings.session_limit,
@@ -413,6 +417,7 @@ async def lifespan(app: FastAPI):
         max_burn_rate=settings.max_burn_rate,
         enable_context_ballooning=settings.enable_context_ballooning,
         dry_run=settings.dry_run,
+        on_trip=settings.on_trip,
         block_secrets=settings.block_secrets,
         redact_secrets=settings.redact_secrets,
         session_limit=settings.session_limit,
@@ -475,6 +480,196 @@ async def _record_and_broadcast_request(
     }
     await broadcaster.broadcast("request_logged", req_payload)
     return rec_id
+
+
+def _build_openai_nudge_response(
+    model: str,
+    nudge_text: str,
+    trip_reason: str,
+    is_streaming: bool = False,
+    tokens_saved: int = 0,
+    usd_saved: float = 0.0,
+) -> Response:
+    """Synthesize a provider-compatible OpenAI 200 OK response (JSON or SSE) for loop nudge recovery."""
+    nudge_id = f"chatcmpl-tokenguard-nudge-{uuid.uuid4()}"
+    created_ts = int(time.time())
+    clean_reason = str(trip_reason).replace("\n", " ").strip()
+    headers = {
+        "X-TokenGuard-Action": "nudged",
+        "X-TokenGuard-Reason": clean_reason,
+        "X-TokenGuard-Tokens-Saved": str(tokens_saved),
+        "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
+    }
+
+    if is_streaming:
+        chunk_1 = {
+            "id": nudge_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": nudge_text,
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        chunk_2 = {
+            "id": nudge_id,
+            "object": "chat.completion.chunk",
+            "created": created_ts,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 30,
+                "total_tokens": 30,
+            },
+        }
+
+        async def _openai_nudge_sse() -> AsyncGenerator[bytes, None]:
+            yield f"data: {json.dumps(chunk_1)}\n\n".encode("utf-8")
+            yield f"data: {json.dumps(chunk_2)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        sse_headers = {
+            **headers,
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(
+            _openai_nudge_sse(),
+            status_code=200,
+            media_type="text/event-stream",
+            headers=sse_headers,
+        )
+
+    payload = {
+        "id": nudge_id,
+        "object": "chat.completion",
+        "created": created_ts,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": nudge_text,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 30,
+            "total_tokens": 30,
+        },
+    }
+    return JSONResponse(status_code=200, content=payload, headers=headers)
+
+
+def _build_anthropic_nudge_response(
+    model: str,
+    nudge_text: str,
+    trip_reason: str,
+    is_streaming: bool = False,
+    tokens_saved: int = 0,
+    usd_saved: float = 0.0,
+) -> Response:
+    """Synthesize a provider-compatible Anthropic /v1/messages 200 OK response (JSON or SSE) for loop nudge recovery."""
+    msg_id = f"msg_tokenguard_nudge_{uuid.uuid4().hex}"
+    clean_reason = str(trip_reason).replace("\n", " ").strip()
+    headers = {
+        "X-TokenGuard-Action": "nudged",
+        "X-TokenGuard-Reason": clean_reason,
+        "X-TokenGuard-Tokens-Saved": str(tokens_saved),
+        "X-TokenGuard-USD-Saved": f"{usd_saved:.4f}",
+    }
+
+    if is_streaming:
+        ev_start = {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }
+        ev_block_start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+        ev_block_delta = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": nudge_text},
+        }
+        ev_block_stop = {"type": "content_block_stop", "index": 0}
+        ev_msg_delta = {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 30},
+        }
+        ev_msg_stop = {"type": "message_stop"}
+
+        async def _anthropic_nudge_sse() -> AsyncGenerator[bytes, None]:
+            yield f"event: message_start\ndata: {json.dumps(ev_start)}\n\n".encode("utf-8")
+            yield f"event: content_block_start\ndata: {json.dumps(ev_block_start)}\n\n".encode("utf-8")
+            yield f"event: content_block_delta\ndata: {json.dumps(ev_block_delta)}\n\n".encode("utf-8")
+            yield f"event: content_block_stop\ndata: {json.dumps(ev_block_stop)}\n\n".encode("utf-8")
+            yield f"event: message_delta\ndata: {json.dumps(ev_msg_delta)}\n\n".encode("utf-8")
+            yield f"event: message_stop\ndata: {json.dumps(ev_msg_stop)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        sse_headers = {
+            **headers,
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(
+            _anthropic_nudge_sse(),
+            status_code=200,
+            media_type="text/event-stream",
+            headers=sse_headers,
+        )
+
+    payload = {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {
+                "type": "text",
+                "text": nudge_text,
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 30,
+        },
+    }
+    return JSONResponse(status_code=200, content=payload, headers=headers)
 
 
 def detect_provider(model: str) -> str:
@@ -810,7 +1005,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {
             "status": "healthy",
             "service": "TokenGuard",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "kill_switch": circuit_breaker.kill_switch_active if circuit_breaker else False,
             "providers": ["openai", "anthropic", "gemini", "dashscope", "deepseek", "groq", "mistral", "openrouter"],
         }
@@ -1005,12 +1200,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         enable_context_ballooning = payload.get("enable_context_ballooning")
         block_secrets = payload.get("block_secrets")
         redact_secrets = payload.get("redact_secrets")
+        on_trip = payload.get("on_trip")
         source = payload.get("source", "web")
 
         if block_secrets is not None:
             current_settings.block_secrets = bool(block_secrets)
         if redact_secrets is not None:
             current_settings.redact_secrets = bool(redact_secrets)
+        if on_trip is not None:
+            normalized_trip = str(on_trip).strip().lower()
+            if normalized_trip in ("block", "nudge"):
+                current_settings.on_trip = normalized_trip
 
         circuit_breaker.update_limits(
             hourly_limit=hourly_limit,
@@ -1022,6 +1222,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             profile=profile,
             max_burn_rate=max_burn_rate,
             enable_context_ballooning=enable_context_ballooning,
+            on_trip=on_trip,
         )
 
         action_text = f"Profile set to {str(profile).capitalize()}" if profile else "Limits updated"
@@ -1099,6 +1300,136 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         sim_type = payload.get("type", "loop")
         model = str(payload.get("model", "gpt-4o"))
         current_settings = get_settings()
+
+        if sim_type == "nudge":
+            tool_name = str(payload.get("tool_name", "read_file"))
+            sim_session = f"sim-nudge-{int(time.time() * 1000)}"
+            threshold = max(2, circuit_breaker.max_tool_repeats or 3)
+            results = []
+            nudge_msg = ""
+            trip_reason = ""
+            tokens_saved = 0
+            usd_saved = 0.0
+
+            prev_on_trip = circuit_breaker.on_trip
+            circuit_breaker.set_on_trip("nudge")
+            try:
+                for i in range(1, threshold + 2):
+                    sim_msgs = [
+                        {"role": "user", "content": "Inspect deployment config"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_nudge_{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": json.dumps({"path": f"/etc/app/config_{i}.yaml"}),
+                                    },
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": f"call_nudge_{i}", "content": "FileNotFoundError"},
+                    ]
+                    p_hash = circuit_breaker.compute_prompt_hash(sim_msgs)
+                    est_tokens = circuit_breaker.estimate_prompt_tokens(sim_msgs)
+                    try:
+                        circuit_breaker.check_tool_retry_ceiling(
+                            sim_session,
+                            tool_name,
+                            model=model,
+                            messages=sim_msgs,
+                        )
+                        circuit_breaker.record_tool_name(sim_session, tool_name)
+                        cost = circuit_breaker.compute_cost(model, est_tokens, 60)
+                        circuit_breaker.record_success(model, est_tokens, 60, cost, p_hash, session_id=sim_session)
+                        await _record_and_broadcast_request(
+                            db_path=current_settings.db_path,
+                            model=model,
+                            prompt_tokens=est_tokens,
+                            completion_tokens=60,
+                            cost_usd=cost,
+                            latency_ms=110 + i * 15,
+                            prompt_hash=p_hash,
+                            status="success",
+                            session_id=sim_session,
+                        )
+                        results.append({"attempt": i, "status": "allowed", "http_status": 200, "tool": tool_name})
+                    except ToolRetryCeilingError as err:
+                        action = circuit_breaker.evaluate_trip_action(sim_session, err, prompt_hash=p_hash)
+                        trip_reason = err.message
+                        t_s, u_s = circuit_breaker.calculate_saved_telemetry(
+                            model=model,
+                            messages=sim_msgs,
+                            session_id=sim_session,
+                            prompt_tokens=est_tokens,
+                        )
+                        tokens_saved += t_s
+                        usd_saved = round(usd_saved + u_s, 4)
+                        if action == "nudge":
+                            nudge_msg = build_nudge_message(err)
+                            await _record_and_broadcast_request(
+                                db_path=current_settings.db_path,
+                                model=model,
+                                prompt_tokens=est_tokens,
+                                completion_tokens=30,
+                                cost_usd=0.0,
+                                latency_ms=0,
+                                prompt_hash=p_hash,
+                                status="nudged_loop",
+                                blocked_reason=err.message,
+                                session_id=sim_session,
+                            )
+                            results.append(
+                                {
+                                    "attempt": i,
+                                    "status": "nudged_loop",
+                                    "http_status": 200,
+                                    "action": "nudged",
+                                    "tool": tool_name,
+                                    "nudge_message": nudge_msg,
+                                    "reason": err.message,
+                                }
+                            )
+                        else:
+                            await _record_and_broadcast_request(
+                                db_path=current_settings.db_path,
+                                model=model,
+                                prompt_tokens=est_tokens,
+                                completion_tokens=0,
+                                cost_usd=0.0,
+                                latency_ms=0,
+                                prompt_hash=p_hash,
+                                status="blocked_tool_retry_ceiling",
+                                blocked_reason=err.message,
+                                session_id=sim_session,
+                            )
+                            results.append(
+                                {
+                                    "attempt": i,
+                                    "status": "blocked_tool_retry_ceiling",
+                                    "http_status": 429,
+                                    "action": "blocked",
+                                    "tool": tool_name,
+                                    "reason": err.message,
+                                }
+                            )
+            finally:
+                circuit_breaker.set_on_trip(prev_on_trip)
+
+            return {
+                "simulation": "nudge",
+                "tool_name": tool_name,
+                "threshold": threshold,
+                "nudge_message": nudge_msg,
+                "trip_reason": trip_reason,
+                "tokens_saved": tokens_saved,
+                "usd_saved": usd_saved,
+                "nudged": True,
+                "escalated": True,
+                "results": results,
+            }
 
         if sim_type == "loop":
             sample_messages = [{"role": "user", "content": "Rogue agent repeating identical prompt sequence for simulation"}]
@@ -1690,21 +2021,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 tokens_saved = tokens_saved if tokens_saved is not None else t_saved
                 usd_saved = usd_saved if usd_saved is not None else u_saved
 
-            await _record_and_broadcast_request(
-                db_path=current_settings.db_path,
-                model=model,
-                prompt_tokens=est_tokens,
-                completion_tokens=0,
-                cost_usd=0.0,
-                latency_ms=0,
-                prompt_hash=prompt_hash,
-                status=status_tag,
-                blocked_reason=cb_err.message,
-                session_id=session_id,
-            )
-
             is_dry_run = getattr(current_settings, "dry_run", False) or getattr(circuit_breaker, "dry_run", False)
             if is_dry_run:
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    latency_ms=0,
+                    prompt_hash=prompt_hash,
+                    status=status_tag,
+                    blocked_reason=cb_err.message,
+                    session_id=session_id,
+                )
                 logger.warning(
                     f"[DRY-RUN SHADOW MODE] Detected trip ({status_tag}): {cb_err.message} — passing request through to upstream"
                 )
@@ -1713,6 +2043,46 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 request.state.tokens_saved = tokens_saved
                 request.state.usd_saved = usd_saved
             else:
+                trip_action = circuit_breaker.evaluate_trip_action(
+                    session_id=session_id,
+                    err=cb_err,
+                    prompt_hash=prompt_hash,
+                )
+                if trip_action == "nudge":
+                    nudge_text = build_nudge_message(cb_err)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=est_tokens,
+                        completion_tokens=30,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=prompt_hash,
+                        status="nudged_loop",
+                        blocked_reason=cb_err.message,
+                        session_id=session_id,
+                    )
+                    return _build_anthropic_nudge_response(
+                        model=model,
+                        nudge_text=nudge_text,
+                        trip_reason=cb_err.message,
+                        is_streaming=is_streaming,
+                        tokens_saved=tokens_saved,
+                        usd_saved=usd_saved,
+                    )
+
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    latency_ms=0,
+                    prompt_hash=prompt_hash,
+                    status=status_tag,
+                    blocked_reason=cb_err.message,
+                    session_id=session_id,
+                )
                 resp_headers = {
                     "X-TokenGuard-Status": "tripped",
                     "X-TokenGuard-Reason": str(cb_err.message).replace("\n", " ").strip(),
@@ -1882,21 +2252,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 tokens_saved = tokens_saved if tokens_saved is not None else t_saved
                 usd_saved = usd_saved if usd_saved is not None else u_saved
 
-            await _record_and_broadcast_request(
-                db_path=current_settings.db_path,
-                model=model,
-                prompt_tokens=est_tokens,
-                completion_tokens=0,
-                cost_usd=0.0,
-                latency_ms=0,
-                prompt_hash=prompt_hash,
-                status=status_tag,
-                blocked_reason=cb_err.message,
-                session_id=session_id,
-            )
-
             is_dry_run = getattr(current_settings, "dry_run", False) or getattr(circuit_breaker, "dry_run", False)
             if is_dry_run:
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    latency_ms=0,
+                    prompt_hash=prompt_hash,
+                    status=status_tag,
+                    blocked_reason=cb_err.message,
+                    session_id=session_id,
+                )
                 logger.warning(
                     f"[DRY-RUN SHADOW MODE] Detected trip ({status_tag}): {cb_err.message} — passing request through to upstream"
                 )
@@ -1905,6 +2274,46 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 request.state.tokens_saved = tokens_saved
                 request.state.usd_saved = usd_saved
             else:
+                trip_action = circuit_breaker.evaluate_trip_action(
+                    session_id=session_id,
+                    err=cb_err,
+                    prompt_hash=prompt_hash,
+                )
+                if trip_action == "nudge":
+                    nudge_text = build_nudge_message(cb_err)
+                    await _record_and_broadcast_request(
+                        db_path=current_settings.db_path,
+                        model=model,
+                        prompt_tokens=est_tokens,
+                        completion_tokens=30,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                        prompt_hash=prompt_hash,
+                        status="nudged_loop",
+                        blocked_reason=cb_err.message,
+                        session_id=session_id,
+                    )
+                    return _build_openai_nudge_response(
+                        model=model,
+                        nudge_text=nudge_text,
+                        trip_reason=cb_err.message,
+                        is_streaming=is_streaming,
+                        tokens_saved=tokens_saved,
+                        usd_saved=usd_saved,
+                    )
+
+                await _record_and_broadcast_request(
+                    db_path=current_settings.db_path,
+                    model=model,
+                    prompt_tokens=est_tokens,
+                    completion_tokens=0,
+                    cost_usd=0.0,
+                    latency_ms=0,
+                    prompt_hash=prompt_hash,
+                    status=status_tag,
+                    blocked_reason=cb_err.message,
+                    session_id=session_id,
+                )
                 resp_content = cb_err.to_dict()
                 if "error" in resp_content and isinstance(resp_content["error"], dict):
                     resp_content["error"]["tokens_saved"] = tokens_saved

@@ -159,6 +159,17 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run in observation mode (detect and log trips, but pass requests through upstream)",
     )
     run_parser.add_argument(
+        "--on-trip",
+        type=str,
+        choices=["block", "nudge"],
+        default=(
+            os.environ.get("TOKENGUARD_ON_TRIP", "block").strip().lower()
+            if os.environ.get("TOKENGUARD_ON_TRIP", "block").strip().lower() in ("block", "nudge")
+            else "block"
+        ),
+        help="Action when a loop circuit trips: 'block' (HTTP 429) or 'nudge' (synthetic 200 OK self-correction on first violation)",
+    )
+    run_parser.add_argument(
         "--block-secrets",
         action="store_true",
         default=os.environ.get("TOKENGUARD_BLOCK_SECRETS", "").lower() in ("true", "1", "yes"),
@@ -203,13 +214,13 @@ def create_parser() -> argparse.ArgumentParser:
     logs_parser = subparsers.add_parser("logs", help="View or stream live LLM request logs")
     logs_parser.add_argument("-f", "--follow", action="store_true", help="Stream live activity in real-time")
     logs_parser.add_argument("-n", "--lines", type=int, default=20, help="Number of recent lines to display (default: 20)")
-    logs_parser.add_argument("--status", type=str, default="all", choices=["all", "success", "blocked"], help="Filter by status")
+    logs_parser.add_argument("--status", type=str, default="all", choices=["all", "success", "blocked", "nudged"], help="Filter by status")
     logs_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     logs_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
     tail_parser = subparsers.add_parser("tail", help="Alias for 'tokenguard logs -f'")
     tail_parser.add_argument("-n", "--lines", type=int, default=20, help="Number of recent lines to display")
-    tail_parser.add_argument("--status", type=str, default="all", choices=["all", "success", "blocked"], help="Filter by status")
+    tail_parser.add_argument("--status", type=str, default="all", choices=["all", "success", "blocked", "nudged"], help="Filter by status")
     tail_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
     tail_parser.add_argument("--port", type=int, default=8080, help="Proxy port (default: 8080)")
 
@@ -260,8 +271,9 @@ def create_parser() -> argparse.ArgumentParser:
             "secret",
             "stream-loop",
             "stream_loop",
+            "nudge",
         ],
-        help="Simulation type (default: loop; choices: loop, budget, success, tool_loop, alternating_loop, drift, stagnation, secret, stream-loop)",
+        help="Simulation type (default: loop; choices: loop, budget, success, tool_loop, alternating_loop, drift, stagnation, secret, stream-loop, nudge)",
     )
     sim_parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for simulation")
     sim_parser.add_argument("--host", type=str, default="127.0.0.1", help="Proxy host (default: 127.0.0.1)")
@@ -289,8 +301,8 @@ def create_parser() -> argparse.ArgumentParser:
         "--status",
         type=str,
         default="all",
-        choices=["all", "success", "blocked"],
-        help="Filter records by status: all (default), success, or blocked",
+        choices=["all", "success", "blocked", "nudged"],
+        help="Filter records by status: all (default), success, blocked, or nudged",
     )
     export_parser.add_argument(
         "--db-path",
@@ -387,6 +399,17 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         help="Run in observation mode (detect and log trips, but pass requests through upstream)",
     )
     p.add_argument(
+        "--on-trip",
+        type=str,
+        choices=["block", "nudge"],
+        default=(
+            os.environ.get("TOKENGUARD_ON_TRIP", "block").strip().lower()
+            if os.environ.get("TOKENGUARD_ON_TRIP", "block").strip().lower() in ("block", "nudge")
+            else "block"
+        ),
+        help="Action when a loop circuit trips: 'block' (HTTP 429) or 'nudge' (synthetic 200 OK self-correction on first violation)",
+    )
+    p.add_argument(
         "--session-limit",
         type=float,
         default=float(os.environ.get("TOKENGUARD_SESSION_LIMIT", 0.0)),
@@ -462,6 +485,7 @@ def print_banner(
     loop_threshold: int,
     max_burn_rate: Optional[str] = None,
     dry_run: bool = False,
+    on_trip: str = "block",
 ) -> None:
     """Display the clean Rich TokenGuard terminal startup banner."""
     base_url = f"http://{host}:{port}"
@@ -477,6 +501,8 @@ def print_banner(
     if max_burn_rate:
         table.add_row("Burn Rate Limit:", f"[bold white]{max_burn_rate}[/bold white]")
     table.add_row("Loop Breaker:", loop_str)
+    if on_trip == "nudge":
+        table.add_row("On-Trip Action:", "[bold cyan]Nudge (Synthetic 200 OK Recovery -> 429 Escalation)[/bold cyan]")
     if dry_run:
         table.add_row("Observation Mode:", "[bold yellow]Active (Dry Run / Pass-through)[/bold yellow]")
 
@@ -484,7 +510,7 @@ def print_banner(
 
     panel = Panel(
         table,
-        title="[bold bright_white]TokenGuard[/bold bright_white] [dim]v0.2.0[/dim]",
+        title="[bold bright_white]TokenGuard[/bold bright_white] [dim]v0.3.0[/dim]",
         subtitle=subtitle,
         box=box.ROUNDED,
         border_style="bright_black",
@@ -551,6 +577,7 @@ def start_daemon(
     passive: bool = False,
     max_burn_rate: Optional[str] = None,
     dry_run: bool = False,
+    on_trip: str = "block",
     max_tool_repeats: int = 3,
     max_stagnant_steps: int = 6,
     block_secrets: bool = False,
@@ -591,6 +618,8 @@ def start_daemon(
         str(db_path),
         "--max-payload-size-mb",
         str(max_payload_size_mb),
+        "--on-trip",
+        str(on_trip),
     ]
     if passive:
         cmd.append("--passive")
@@ -1471,6 +1500,8 @@ def cmd_logs(args: argparse.Namespace) -> None:
                 status_str = r.get("status", "unknown")
                 if status_str == "success":
                     badge = "[bold green]200 OK[/bold green]"
+                elif status_str == "nudged_loop":
+                    badge = "[bold cyan]200 NUDGED[/bold cyan]"
                 elif status_str == "blocked_loop":
                     badge = "[bold red]BLOCKED: LOOP[/bold red]"
                 elif status_str == "blocked_budget":
@@ -1497,6 +1528,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     """Start the proxy server and dashboard in foreground or daemon mode."""
     is_passive = getattr(args, "passive", False)
     is_dry_run = getattr(args, "dry_run", False)
+    on_trip = str(getattr(args, "on_trip", os.environ.get("TOKENGUARD_ON_TRIP", "block")) or "block").strip().lower()
+    if on_trip not in ("block", "nudge"):
+        on_trip = "block"
     block_secrets = getattr(args, "block_secrets", False)
     redact_secrets = getattr(args, "redact_secrets", False)
     max_payload_size_mb = getattr(args, "max_payload_size_mb", 15.0)
@@ -1520,6 +1554,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
                 dry_run=is_dry_run,
+                on_trip=on_trip,
                 max_tool_repeats=max_tool_repeats,
                 max_stagnant_steps=max_stagnant_steps,
                 block_secrets=block_secrets,
@@ -1576,6 +1611,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         profile="passive" if is_passive else "careful",
         passive=is_passive,
         dry_run=is_dry_run,
+        on_trip=on_trip,
         block_secrets=block_secrets,
         redact_secrets=redact_secrets,
         max_payload_size_mb=max_payload_size_mb,
@@ -1590,6 +1626,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         loop_threshold=settings.loop_threshold,
         max_burn_rate=settings.max_burn_rate,
         dry_run=is_dry_run,
+        on_trip=settings.on_trip,
     )
 
     uvicorn.run(
@@ -1626,6 +1663,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     port = getattr(args, "port", 8080)
     is_passive = getattr(args, "passive", False)
     is_dry_run = getattr(args, "dry_run", False)
+    on_trip = str(getattr(args, "on_trip", os.environ.get("TOKENGUARD_ON_TRIP", "block")) or "block").strip().lower()
+    if on_trip not in ("block", "nudge"):
+        on_trip = "block"
     block_secrets = getattr(args, "block_secrets", False)
     redact_secrets = getattr(args, "redact_secrets", False)
     max_payload_size_mb = getattr(args, "max_payload_size_mb", 15.0)
@@ -1649,6 +1689,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 passive=is_passive,
                 max_burn_rate=getattr(args, "max_burn_rate", None),
                 dry_run=is_dry_run,
+                on_trip=on_trip,
                 max_tool_repeats=max_tool_repeats,
                 max_stagnant_steps=max_stagnant_steps,
                 block_secrets=block_secrets,
@@ -2326,12 +2367,149 @@ def _render_stream_loop_demo(
     )
 
 
+def _render_nudge_demo(
+    data: dict,
+    is_local: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
+    """Render Rich panel demonstrating synthetic 200 OK Loop Nudge recovery followed by 429 escalation."""
+    results = data.get("results", [])
+    nudge_msg = data.get("nudge_message", "")
+    trip_reason = data.get("trip_reason", "ToolRetryCeilingTripped")
+    usd_saved = float(data.get("usd_saved", 0.0) or 0.0)
+    tool_name = data.get("tool_name", "read_file")
+
+    lines = []
+    for item in results:
+        attempt = item.get("attempt", 0)
+        st = item.get("status", "")
+        if st == "allowed":
+            lines.append(f"  [dim]Turn {attempt}:[/dim] [green]200 OK[/green] — tool [cyan]{tool_name}[/cyan] executed")
+        elif st == "nudged_loop":
+            lines.append(
+                f"  [dim]Turn {attempt}:[/dim] [bold cyan]200 OK (Synthetic Nudge)[/bold cyan] — "
+                f"[cyan]X-TokenGuard-Action: nudged[/cyan] (status: [bold]nudged_loop[/bold])"
+            )
+        else:
+            lines.append(
+                f"  [dim]Turn {attempt}:[/dim] [bold red]429 Too Many Requests[/bold red] — "
+                f"Nudge ignored; escalated to hard block ([red]{st}[/red])"
+            )
+
+    mode_text = (
+        "[dim](Executed in-process local simulation)[/dim]"
+        if is_local
+        else f"[dim](Live proxy on http://{host}:{port} — logged to SQLite & SSE stream)[/dim]"
+    )
+
+    steps_str = "\n".join(lines)
+    panel_body = (
+        f"[bold cyan]● Loop Nudge Synthetic Recovery Mode (--on-trip=nudge)[/bold cyan]\n\n"
+        f"[bold white]Execution Sequence:[/bold white]\n{steps_str}\n\n"
+        f"[bold white]Synthetic 200 OK Assistant Message:[/bold white]\n"
+        f"  [italic bright_white]\"{nudge_msg}\"[/italic bright_white]\n\n"
+        f"[bold white]Headers:[/bold white]\n"
+        f"  [cyan]X-TokenGuard-Action:[/cyan] nudged\n"
+        f"  [cyan]X-TokenGuard-Reason:[/cyan] {trip_reason}\n"
+        f"[bold green]Avoided Cost:[/bold green] +${usd_saved:.4f} estimated saved spend\n\n"
+        f"{mode_text}"
+    )
+
+    console.print(
+        Panel(
+            panel_body,
+            title="[bold bright_white]Circuit Breaker: Loop Nudge Recovery & Escalation Demo[/bold bright_white]",
+            box=box.ROUNDED,
+            border_style="cyan",
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
 def cmd_simulate(args: argparse.Namespace) -> None:
     """Run circuit breaker simulation to demo protection mechanisms."""
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8080)
     sim_type = getattr(args, "type", "loop")
     sim_model = getattr(args, "model", "gpt-4o")
+
+    if sim_type == "nudge":
+        if is_server_running(host, port):
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    res = client.post(
+                        f"http://{host}:{port}/api/simulate",
+                        json={"type": "nudge", "model": sim_model},
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("simulation") == "nudge" and data.get("results"):
+                            _render_nudge_demo(data, is_local=False, host=host, port=port)
+                            return
+            except Exception:
+                pass
+
+        from tokenguard.guard import CircuitBreaker, ToolRetryCeilingError, build_nudge_message
+
+        guard = CircuitBreaker(max_tool_repeats=3, on_trip="nudge", enable_notifications=False)
+        session_id = f"demo_nudge_{int(time.time())}"
+        tool_name = "read_file"
+        results = []
+        nudge_msg = ""
+        trip_reason = ""
+        usd_saved = 0.0
+
+        for i in range(1, 5):
+            sim_msgs = [{"role": "user", "content": f"Read config_{i}.yaml"}]
+            try:
+                guard.check_tool_retry_ceiling(session_id, tool_name, model=sim_model, messages=sim_msgs)
+                guard.record_tool_name(session_id, tool_name)
+                results.append({"attempt": i, "status": "allowed", "http_status": 200, "tool": tool_name})
+            except ToolRetryCeilingError as err:
+                action = guard.evaluate_trip_action(session_id, err)
+                trip_reason = err.message
+                _, u_s = guard.calculate_saved_telemetry(model=sim_model, messages=sim_msgs, session_id=session_id)
+                usd_saved = round(usd_saved + u_s, 4)
+                if action == "nudge":
+                    nudge_msg = build_nudge_message(err)
+                    results.append(
+                        {
+                            "attempt": i,
+                            "status": "nudged_loop",
+                            "http_status": 200,
+                            "action": "nudged",
+                            "tool": tool_name,
+                            "nudge_message": nudge_msg,
+                            "reason": err.message,
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "attempt": i,
+                            "status": "blocked_tool_retry_ceiling",
+                            "http_status": 429,
+                            "action": "blocked",
+                            "tool": tool_name,
+                            "reason": err.message,
+                        }
+                    )
+
+        data = {
+            "simulation": "nudge",
+            "tool_name": tool_name,
+            "threshold": 3,
+            "nudge_message": nudge_msg,
+            "trip_reason": trip_reason,
+            "usd_saved": usd_saved,
+            "nudged": True,
+            "escalated": True,
+            "results": results,
+        }
+        _render_nudge_demo(data, is_local=True)
+        return
 
     if sim_type in ("alternating_loop", "alternating"):
         if is_server_running(host, port):
