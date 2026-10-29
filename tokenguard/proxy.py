@@ -48,6 +48,7 @@ from tokenguard.guard import (
     KillSwitchActiveError,
     LoopDetectedError,
     SecretLeakError,
+    SessionBudgetLimitError,
     ToolPingPongError,
     parse_burn_rate,
     redact_secrets_in_obj,
@@ -193,6 +194,73 @@ class StreamAccumulator:
         return final_prompt, final_completion
 
 
+class StreamLoopDetector:
+    def __init__(self, buffer_size: int = 200, max_repeats: int = 5, min_len: int = 2):
+        self.buffer_size = buffer_size
+        self.max_repeats = max_repeats
+        self.min_len = min_len
+        self._raw_buffer = ""
+        self._text_buffer = ""
+        self.loop_detected = False
+        self.repeated_phrase = ""
+
+    def feed(self, chunk: bytes) -> bool:
+        if self.loop_detected:
+            return True
+        try:
+            text = chunk.decode("utf-8", errors="ignore")
+            self._raw_buffer += text
+            while "\n" in self._raw_buffer:
+                line, self._raw_buffer = self._raw_buffer.split("\n", 1)
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                if data_str.startswith("{") and data_str.endswith("}"):
+                    try:
+                        payload = json.loads(data_str)
+                        choices = payload.get("choices")
+                        if choices and isinstance(choices, list):
+                            for ch in choices:
+                                delta = ch.get("delta")
+                                if delta and isinstance(delta, dict):
+                                    c = delta.get("content")
+                                    if c and isinstance(c, str):
+                                        self._append_text(c)
+                        delta = payload.get("delta")
+                        if delta and isinstance(delta, dict):
+                            t = delta.get("text")
+                            if t and isinstance(t, str):
+                                self._append_text(t)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return self.loop_detected
+
+    def feed_text(self, text: str) -> bool:
+        self._append_text(text)
+        return self.loop_detected
+
+    def _append_text(self, text: str) -> None:
+        self._text_buffer += text
+        if len(self._text_buffer) > self.buffer_size:
+            self._text_buffer = self._text_buffer[-self.buffer_size:]
+        self._check_repetition()
+
+    def _check_repetition(self) -> None:
+        buf = self._text_buffer
+        max_l = len(buf) // self.max_repeats
+        for l in range(self.min_len, max_l + 1):
+            phrase = buf[-l:]
+            if buf.endswith(phrase * self.max_repeats):
+                self.loop_detected = True
+                self.repeated_phrase = phrase
+                return
+
+
 def _detect_task_update(
     headers: Dict[str, str],
     body: Dict[str, Any],
@@ -300,6 +368,9 @@ def get_guard() -> CircuitBreaker:
             dry_run=settings.dry_run,
             block_secrets=settings.block_secrets,
             redact_secrets=settings.redact_secrets,
+            session_limit=settings.session_limit,
+            max_active_sessions=settings.max_active_sessions,
+            session_ttl_seconds=settings.session_ttl_seconds,
         )
     return circuit_breaker
 
@@ -342,6 +413,9 @@ async def lifespan(app: FastAPI):
         dry_run=settings.dry_run,
         block_secrets=settings.block_secrets,
         redact_secrets=settings.redact_secrets,
+        session_limit=settings.session_limit,
+        max_active_sessions=settings.max_active_sessions,
+        session_ttl_seconds=settings.session_ttl_seconds,
     )
 
     recent_spends = await get_recent_spends(settings.db_path, hours=24.0)
@@ -1365,7 +1439,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             or request.headers.get("session-id")
             or request.headers.get("x-agent-id")
             or request.headers.get("agent-id")
+            or request.query_params.get("session_id")
+            or body.get("session_id")
             or (body.get("metadata", {}).get("user_id") if isinstance(body.get("metadata"), dict) else None)
+            or (body.get("metadata", {}).get("session_id") if isinstance(body.get("metadata"), dict) else None)
             or (body.get("metadata", {}).get("agent_id") if isinstance(body.get("metadata"), dict) else None)
             or "default"
         )
@@ -1390,6 +1467,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_tag = "blocked_tool_retry_ceiling"
             elif err_code == "SessionStagnationTripped":
                 status_tag = "blocked_stagnation"
+            elif err_code == "SessionBudgetLimitTripped":
+                status_tag = "blocked_session_budget"
             elif err_code == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
             elif err_code == "context_ballooning_detected":
@@ -1452,7 +1531,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                         content=cb_err.to_dict(),
                     )
 
-                if err_code in ("TOOL_PING_PONG_LOOP", "ToolRetryCeilingTripped", "SessionStagnationTripped"):
+                if err_code in ("TOOL_PING_PONG_LOOP", "ToolRetryCeilingTripped", "SessionStagnationTripped", "SessionBudgetLimitTripped"):
                     err_dict = cb_err.to_dict()
                     if "error" in err_dict and isinstance(err_dict["error"], dict):
                         err_dict["error"]["tokens_saved"] = tokens_saved
@@ -1551,8 +1630,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             or request.headers.get("session-id")
             or request.headers.get("x-agent-id")
             or request.headers.get("agent-id")
+            or request.query_params.get("session_id")
+            or body.get("session_id")
             or body.get("user")
             or (body.get("metadata", {}).get("user_id") if isinstance(body.get("metadata"), dict) else None)
+            or (body.get("metadata", {}).get("session_id") if isinstance(body.get("metadata"), dict) else None)
             or (body.get("metadata", {}).get("agent_id") if isinstance(body.get("metadata"), dict) else None)
             or "default"
         )
@@ -1577,6 +1659,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_tag = "blocked_tool_retry_ceiling"
             elif err_code == "SessionStagnationTripped":
                 status_tag = "blocked_stagnation"
+            elif err_code == "SessionBudgetLimitTripped":
+                status_tag = "blocked_session_budget"
             elif err_code == "burn_rate_exceeded" or cb_err.error_type == "tokenguard_budget_breach":
                 status_tag = "blocked_burn_rate"
             elif err_code == "context_ballooning_detected":
@@ -1899,10 +1983,18 @@ async def _handle_anthropic_streaming(
         prompt_est = circuit_breaker.estimate_prompt_tokens(messages)
         accumulator = StreamAccumulator(is_anthropic=True, prompt_tokens_estimate=prompt_est)
         accumulator.start()
+        detector = StreamLoopDetector()
         is_cancelled = False
+        is_loop_aborted = False
+        loop_phrase = ""
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
+                if detector.feed(chunk):
+                    is_loop_aborted = True
+                    loop_phrase = detector.repeated_phrase
+                    logger.warning(f"mid_stream_loop_aborted: repetitive loop detected in stream ('{loop_phrase}')")
+                    break
                 yield chunk
                 accumulator.feed(chunk)
         except (asyncio.CancelledError, GeneratorExit):
@@ -1924,8 +2016,15 @@ async def _handle_anthropic_streaming(
             cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
             circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
 
-            req_status = "cancelled" if is_cancelled else "success"
-            blocked_reason = "Client disconnected / stream cancelled" if is_cancelled else None
+            if is_loop_aborted:
+                req_status = "blocked_stream_loop"
+                blocked_reason = f"mid_stream_loop_aborted: repetitive pattern '{loop_phrase}'"
+            elif is_cancelled:
+                req_status = "cancelled"
+                blocked_reason = "Client disconnected / stream cancelled"
+            else:
+                req_status = "success"
+                blocked_reason = None
 
             async def _finalize_record():
                 try:
@@ -2022,6 +2121,9 @@ async def _handle_openai_to_anthropic_adapter(
             completion_tokens = 0
             chunk_id = f"chatcmpl-claude-{int(time.time())}"
             is_cancelled = False
+            is_loop_aborted = False
+            loop_phrase = ""
+            detector = StreamLoopDetector()
 
             try:
                 async for chunk in upstream_resp.aiter_bytes():
@@ -2045,6 +2147,11 @@ async def _handle_openai_to_anthropic_adapter(
                                     prompt_tokens = int(u["input_tokens"])
                             elif ptype == "content_block_delta":
                                 text = payload.get("delta", {}).get("text", "")
+                                if detector.feed_text(text):
+                                    is_loop_aborted = True
+                                    loop_phrase = detector.repeated_phrase
+                                    logger.warning(f"mid_stream_loop_aborted: repetitive loop detected in adapted Claude stream ('{loop_phrase}')")
+                                    break
                                 openai_chunk = {
                                     "id": chunk_id,
                                     "object": "chat.completion.chunk",
@@ -2059,21 +2166,24 @@ async def _handle_openai_to_anthropic_adapter(
                                     completion_tokens = int(u["output_tokens"])
                         except Exception:
                             pass
+                    if is_loop_aborted:
+                        break
 
-                stop_chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                    },
-                }
-                yield f"data: {json.dumps(stop_chunk)}\n\n".encode("utf-8")
-                yield b"data: [DONE]\n\n"
+                if not is_loop_aborted:
+                    stop_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                    }
+                    yield f"data: {json.dumps(stop_chunk)}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
             except (asyncio.CancelledError, GeneratorExit):
                 is_cancelled = True
                 raise
@@ -2092,6 +2202,9 @@ async def _handle_openai_to_anthropic_adapter(
                 cost_usd = circuit_breaker.compute_cost(model, prompt_tokens, completion_tokens)
                 circuit_breaker.record_success(model, prompt_tokens, completion_tokens, cost_usd, prompt_hash, session_id=session_id)
 
+                req_status = "blocked_stream_loop" if is_loop_aborted else ("cancelled" if is_cancelled else "success")
+                blocked_reason = f"mid_stream_loop_aborted: repetitive pattern '{loop_phrase}'" if is_loop_aborted else ("Client disconnected / stream cancelled" if is_cancelled else None)
+
                 async def _finalize():
                     try:
                         await _record_and_broadcast_request(
@@ -2102,7 +2215,8 @@ async def _handle_openai_to_anthropic_adapter(
                             cost_usd=cost_usd,
                             latency_ms=latency_ms,
                             prompt_hash=prompt_hash,
-                            status="cancelled" if is_cancelled else "success",
+                            status=req_status,
+                            blocked_reason=blocked_reason,
                         )
                     except Exception as e:
                         logger.error(f"Failed to record adapted Claude stream: {e}")
@@ -2321,10 +2435,18 @@ async def _handle_streaming_chat(
         prompt_est = circuit_breaker.estimate_prompt_tokens(messages)
         accumulator = StreamAccumulator(is_anthropic=False, prompt_tokens_estimate=prompt_est)
         accumulator.start()
+        detector = StreamLoopDetector()
         is_cancelled = False
+        is_loop_aborted = False
+        loop_phrase = ""
 
         try:
             async for chunk in upstream_resp.aiter_bytes():
+                if detector.feed(chunk):
+                    is_loop_aborted = True
+                    loop_phrase = detector.repeated_phrase
+                    logger.warning(f"mid_stream_loop_aborted: repetitive loop detected in stream ('{loop_phrase}')")
+                    break
                 yield chunk
                 accumulator.feed(chunk)
         except (asyncio.CancelledError, GeneratorExit):
@@ -2353,8 +2475,15 @@ async def _handle_streaming_chat(
                 session_id=session_id,
             )
 
-            req_status = "cancelled" if is_cancelled else "success"
-            blocked_reason = "Client disconnected / stream cancelled" if is_cancelled else None
+            if is_loop_aborted:
+                req_status = "blocked_stream_loop"
+                blocked_reason = f"mid_stream_loop_aborted: repetitive pattern '{loop_phrase}'"
+            elif is_cancelled:
+                req_status = "cancelled"
+                blocked_reason = "Client disconnected / stream cancelled"
+            else:
+                req_status = "success"
+                blocked_reason = None
 
             async def _finalize_record():
                 try:

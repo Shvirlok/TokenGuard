@@ -1,5 +1,3 @@
-"""CLI entrypoint and background daemon manager for TokenGuard."""
-
 from __future__ import annotations
 
 import argparse
@@ -118,6 +116,12 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Maximum duplicate consecutive requests before tripping loop guard (default: 3, set 0 to disable)",
+    )
+    run_parser.add_argument(
+        "--session-limit",
+        type=float,
+        default=float(os.environ.get("TOKENGUARD_SESSION_LIMIT", 0.0)),
+        help="Spending budget cap in USD per session (default: 0.0 = disabled)",
     )
     run_parser.add_argument(
         "--max-tool-repeats",
@@ -370,6 +374,12 @@ def _add_server_args(p: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="Run in observation mode (detect and log trips, but pass requests through upstream)",
+    )
+    p.add_argument(
+        "--session-limit",
+        type=float,
+        default=float(os.environ.get("TOKENGUARD_SESSION_LIMIT", 0.0)),
+        help="Spending budget cap in USD per session (default: 0.0 = disabled)",
     )
     p.add_argument(
         "--max-repeats",
@@ -1558,6 +1568,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         block_secrets=block_secrets,
         redact_secrets=redact_secrets,
         max_payload_size_mb=max_payload_size_mb,
+        session_limit=float(getattr(args, "session_limit", 0.0)),
     )
     set_settings(settings)
 

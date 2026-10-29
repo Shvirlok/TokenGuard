@@ -1,5 +1,3 @@
-"""Configuration module for TokenGuard."""
-
 from __future__ import annotations
 
 import json
@@ -54,6 +52,9 @@ class Settings(BaseSettings):
     max_stagnant_steps: int = Field(default=6, description="Maximum consecutive non-mutating steps without state change before tripping (0 to disable)")
     block_secrets: bool = Field(default=False, description="Abort requests containing detected raw secrets/API keys")
     redact_secrets: bool = Field(default=False, description="Redact detected secrets in messages before upstream forwarding")
+    session_limit: float = Field(default=0.0, description="Spending budget cap in USD per session (0.0 to disable)")
+    max_active_sessions: int = Field(default=1000, description="Maximum in-memory active sessions before LRU eviction")
+    session_ttl_seconds: float = Field(default=3600.0, description="Idle session state time-to-live in seconds before eviction")
     max_payload_size_mb: float = Field(default=15.0, description="Maximum allowed request payload size in MB before returning HTTP 413")
     admin_token: Optional[str] = Field(default=None, description="Admin token for authenticating mutating control API routes")
     admin_token_required: bool = Field(default=True, description="Enforce X-TokenGuard-Admin-Token on mutating /api/* routes")

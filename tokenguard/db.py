@@ -1,5 +1,3 @@
-"""Database module for TokenGuard using aiosqlite in WAL mode."""
-
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -153,9 +151,13 @@ async def get_metrics(
                 COUNT(*) AS total_requests,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_requests,
                 COALESCE(SUM(CASE WHEN status LIKE 'blocked%' THEN 1 ELSE 0 END), 0) AS blocked_requests,
-                COALESCE(SUM(CASE WHEN status = 'blocked_budget' THEN 1 ELSE 0 END), 0) AS blocked_budget_count,
-                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop') THEN 1 ELSE 0 END), 0) AS blocked_loop_count,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_budget', 'blocked_session_budget') THEN 1 ELSE 0 END), 0) AS blocked_budget_count,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop', 'blocked_tool_retry_ceiling', 'blocked_stagnation', 'blocked_secret_leak', 'blocked_stream_loop') THEN 1 ELSE 0 END), 0) AS blocked_loop_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_tool_loop' THEN 1 ELSE 0 END), 0) AS blocked_tool_loop_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_tool_retry_ceiling' THEN 1 ELSE 0 END), 0) AS blocked_retry_ceiling_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_stagnation' THEN 1 ELSE 0 END), 0) AS blocked_stagnation_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_secret_leak' THEN 1 ELSE 0 END), 0) AS blocked_secret_count,
+                COALESCE(SUM(CASE WHEN status = 'blocked_session_budget' THEN 1 ELSE 0 END), 0) AS blocked_session_budget_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_killswitch' THEN 1 ELSE 0 END), 0) AS blocked_killswitch_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_burn_rate' THEN 1 ELSE 0 END), 0) AS blocked_burn_rate_count,
                 COALESCE(SUM(CASE WHEN status = 'blocked_context_ballooning' THEN 1 ELSE 0 END), 0) AS blocked_context_ballooning_count,
@@ -175,9 +177,12 @@ async def get_metrics(
                 COUNT(*) AS all_time_total_requests,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN cost_usd ELSE 0.0 END), 0.0) AS all_time_spent,
                 COALESCE(SUM(CASE WHEN status = 'success' THEN prompt_tokens + completion_tokens ELSE 0 END), 0) AS all_time_tokens,
-                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop') THEN 1 ELSE 0 END), 0) AS all_time_blocked_loops,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_loop', 'blocked_tool_loop', 'blocked_tool_retry_ceiling', 'blocked_stagnation', 'blocked_secret_leak', 'blocked_stream_loop') THEN 1 ELSE 0 END), 0) AS all_time_blocked_loops,
                 COALESCE(SUM(CASE WHEN status = 'blocked_tool_loop' THEN 1 ELSE 0 END), 0) AS all_time_blocked_tool_loops,
-                COALESCE(SUM(CASE WHEN status = 'blocked_budget' THEN 1 ELSE 0 END), 0) AS all_time_blocked_budget,
+                COALESCE(SUM(CASE WHEN status = 'blocked_tool_retry_ceiling' THEN 1 ELSE 0 END), 0) AS all_time_blocked_retry_ceiling,
+                COALESCE(SUM(CASE WHEN status = 'blocked_stagnation' THEN 1 ELSE 0 END), 0) AS all_time_blocked_stagnation,
+                COALESCE(SUM(CASE WHEN status = 'blocked_secret_leak' THEN 1 ELSE 0 END), 0) AS all_time_blocked_secret,
+                COALESCE(SUM(CASE WHEN status IN ('blocked_budget', 'blocked_session_budget') THEN 1 ELSE 0 END), 0) AS all_time_blocked_budget,
                 COALESCE(SUM(CASE WHEN status LIKE 'blocked%' THEN 1 ELSE 0 END), 0) AS all_time_blocked_total
             FROM requests
         """
@@ -213,7 +218,13 @@ async def get_metrics(
             "blocked_requests": window_data.get("blocked_requests", 0),
             "blocked_budget_count": window_data.get("blocked_budget_count", 0),
             "blocked_loop_count": window_data.get("blocked_loop_count", 0),
+            "blocked_retry_ceiling_count": window_data.get("blocked_retry_ceiling_count", 0),
+            "blocked_stagnation_count": window_data.get("blocked_stagnation_count", 0),
+            "blocked_secret_count": window_data.get("blocked_secret_count", 0),
+            "blocked_session_budget_count": window_data.get("blocked_session_budget_count", 0),
             "blocked_killswitch_count": window_data.get("blocked_killswitch_count", 0),
+            "blocked_burn_rate_count": window_data.get("blocked_burn_rate_count", 0),
+            "blocked_context_ballooning_count": window_data.get("blocked_context_ballooning_count", 0),
             "total_spent": round(window_data.get("total_spent", 0.0), 6),
             "total_prompt_tokens": window_data.get("total_prompt_tokens", 0),
             "total_completion_tokens": window_data.get("total_completion_tokens", 0),
@@ -222,6 +233,9 @@ async def get_metrics(
             "all_time_spent": round(all_time_data.get("all_time_spent", 0.0), 6),
             "all_time_tokens": all_time_data.get("all_time_tokens", 0),
             "all_time_blocked_loops": all_time_data.get("all_time_blocked_loops", 0),
+            "all_time_blocked_retry_ceiling": all_time_data.get("all_time_blocked_retry_ceiling", 0),
+            "all_time_blocked_stagnation": all_time_data.get("all_time_blocked_stagnation", 0),
+            "all_time_blocked_secret": all_time_data.get("all_time_blocked_secret", 0),
             "all_time_blocked_budget": all_time_data.get("all_time_blocked_budget", 0),
             "all_time_blocked_total": all_time_data.get("all_time_blocked_total", 0),
             "saved_cost_estimate": saved_cost_estimate,

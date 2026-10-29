@@ -1,5 +1,3 @@
-"""Circuit breaker and guard engine for TokenGuard."""
-
 from __future__ import annotations
 
 import collections
@@ -428,6 +426,54 @@ class KillSwitchActiveError(CircuitBreakerError):
             tokens_saved=tokens_saved,
             usd_saved=usd_saved,
         )
+
+
+class SessionBudgetLimitError(CircuitBreakerError):
+    def __init__(
+        self,
+        current_spend: float,
+        session_limit: float,
+        session_id: str = "",
+        message: Optional[str] = None,
+        tokens_saved: Optional[int] = None,
+        usd_saved: Optional[float] = None,
+    ):
+        msg = message or f"SessionBudgetLimitTripped: session spend ${current_spend:.4f} exceeded limit ${session_limit:.4f}"
+        super().__init__(
+            message=msg,
+            error_type="circuit_breaker",
+            status_code=429,
+            code="SessionBudgetLimitTripped",
+            reason="SessionBudgetLimitTripped",
+            current_spend=round(current_spend, 4),
+            session_limit=round(session_limit, 4),
+            session_id=session_id,
+            tokens_saved=tokens_saved,
+            usd_saved=usd_saved,
+        )
+        self.reason = "SessionBudgetLimitTripped"
+        self.current_spend = current_spend
+        self.session_limit = session_limit
+        self.session_id = session_id
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "type": "circuit_breaker",
+            "code": "SessionBudgetLimitTripped",
+            "reason": "SessionBudgetLimitTripped",
+            "message": self.message,
+            "session_id": self.session_id,
+            "current_spend": round(self.current_spend, 4),
+            "session_limit": round(self.session_limit, 4),
+        }
+        if self.tokens_saved is not None:
+            data["tokens_saved"] = self.tokens_saved
+        if self.usd_saved is not None:
+            data["usd_saved"] = self.usd_saved
+        return {
+            "reason": "SessionBudgetLimitTripped",
+            "error": data,
+        }
 
 
 class SecretLeakError(CircuitBreakerError):
@@ -1085,6 +1131,98 @@ def calculate_avoided_cost(
     return prompt_cost + completion_cost
 
 
+class ExpiringLRUDict(collections.OrderedDict):
+    def __init__(
+        self,
+        max_size: int = 1000,
+        ttl_seconds: float = 3600.0,
+        default_factory: Optional[Callable[[], Any]] = None,
+    ):
+        super().__init__()
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self.default_factory = default_factory
+        self._timestamps: Dict[Any, float] = {}
+        self._lock = threading.RLock()
+
+    def __getitem__(self, key: Any) -> Any:
+        with self._lock:
+            now = time.time()
+            if super().__contains__(key):
+                if now - self._timestamps.get(key, 0.0) > self.ttl_seconds:
+                    self.pop(key, None)
+                    self._timestamps.pop(key, None)
+                    if self.default_factory is not None:
+                        val = self.default_factory()
+                        self[key] = val
+                        return val
+                    raise KeyError(key)
+                self.move_to_end(key)
+                self._timestamps[key] = now
+                return super().__getitem__(key)
+            if self.default_factory is not None:
+                val = self.default_factory()
+                self[key] = val
+                return val
+            raise KeyError(key)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        with self._lock:
+            now = time.time()
+            if super().__contains__(key):
+                self.move_to_end(key)
+            self._timestamps[key] = now
+            super().__setitem__(key, value)
+            self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        expired = [k for k, ts in list(self._timestamps.items()) if now - ts > self.ttl_seconds]
+        for k in expired:
+            self.pop(k, None)
+            self._timestamps.pop(k, None)
+        while len(self) > self.max_size:
+            oldest = next(iter(self))
+            self.pop(oldest, None)
+            self._timestamps.pop(oldest, None)
+
+    def __contains__(self, key: Any) -> bool:
+        with self._lock:
+            if super().__contains__(key):
+                if time.time() - self._timestamps.get(key, 0.0) > self.ttl_seconds:
+                    self.pop(key, None)
+                    self._timestamps.pop(key, None)
+                    return False
+                return True
+            return False
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            if key in self:
+                return self[key]
+            return default
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        with self._lock:
+            self._timestamps.pop(key, None)
+            return super().pop(key, *args)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._timestamps.clear()
+            super().clear()
+
+    def touch(self, key: Any) -> None:
+        with self._lock:
+            now = time.time()
+            if key in self:
+                self.move_to_end(key)
+                self._timestamps[key] = now
+
+    def prune_expired(self) -> None:
+        with self._lock:
+            self._prune(time.time())
+
+
 class CircuitBreaker:
     """In-memory circuit breaker tracking spending windows, loop detection, burn rate, and manual kill switch."""
 
@@ -1108,6 +1246,9 @@ class CircuitBreaker:
         dry_run: bool = False,
         block_secrets: bool = False,
         redact_secrets: bool = False,
+        session_limit: float = 0.0,
+        max_active_sessions: int = 1000,
+        session_ttl_seconds: float = 3600.0,
     ):
         self._lock = threading.RLock()
         self.hourly_limit = hourly_limit
@@ -1132,6 +1273,9 @@ class CircuitBreaker:
         self.dry_run = dry_run
         self.block_secrets = block_secrets
         self.redact_secrets = redact_secrets
+        self.session_limit = session_limit
+        self.max_active_sessions = max_active_sessions
+        self.session_ttl_seconds = session_ttl_seconds
 
         self.burn_rate_limit: Optional[float] = None
         self.burn_rate_window_seconds: Optional[float] = None
@@ -1142,17 +1286,37 @@ class CircuitBreaker:
 
         self._spend_records: Deque[Tuple[float, float]] = collections.deque()
         self.recent_hashes: Deque[Tuple[float, str]] = collections.deque(maxlen=loop_window_size)
-        self._session_hashes: Dict[str, Deque[Tuple[float, str]]] = collections.defaultdict(
-            lambda: collections.deque(maxlen=10)
+        self._session_hashes: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+            default_factory=lambda: collections.deque(maxlen=10),
         )
-        self._session_history: Dict[str, Deque[Dict[str, Any]]] = collections.defaultdict(
-            lambda: collections.deque(maxlen=20)
+        self._session_history: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+            default_factory=lambda: collections.deque(maxlen=20),
         )
-        self._tool_history: Dict[str, Deque[Tuple[float, str, str]]] = collections.defaultdict(
-            lambda: collections.deque(maxlen=10)
+        self._tool_history: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+            default_factory=lambda: collections.deque(maxlen=10),
         )
-        self._tool_repeat_state: Dict[str, Tuple[str, int, float]] = {}
-        self._stagnant_steps: Dict[str, int] = {}
+        self._tool_repeat_state: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+        )
+        self._stagnant_steps: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+        )
+        self._session_spend: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+        )
+        self._session_last_seen: ExpiringLRUDict = ExpiringLRUDict(
+            max_size=max_active_sessions,
+            ttl_seconds=session_ttl_seconds,
+        )
         self.prices: Dict[str, Dict[str, float]] = self._load_prices()
 
     @property
@@ -1200,6 +1364,44 @@ class CircuitBreaker:
     def set_dry_run(self, enabled: bool) -> None:
         """Toggle dry-run / observation mode on the circuit breaker."""
         self.dry_run = bool(enabled)
+
+    def _touch_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        now = time.time()
+        self._session_last_seen[session_id] = now
+        self._evict_idle_sessions(now)
+
+    def _evict_idle_sessions(self, now: Optional[float] = None) -> None:
+        t = now if now is not None else time.time()
+        expired = [
+            sid for sid, ts in list(self._session_last_seen._timestamps.items())
+            if t - ts > self.session_ttl_seconds
+        ]
+        for sid in expired:
+            self._evict_session(sid)
+        while len(self._session_last_seen) > self.max_active_sessions:
+            oldest_sid = next(iter(self._session_last_seen))
+            self._evict_session(oldest_sid)
+
+    def _evict_session(self, session_id: str) -> None:
+        self._session_last_seen.pop(session_id, None)
+        self._session_hashes.pop(session_id, None)
+        self._session_history.pop(session_id, None)
+        self._tool_history.pop(session_id, None)
+        self._tool_repeat_state.pop(session_id, None)
+        self._stagnant_steps.pop(session_id, None)
+        self._session_spend.pop(session_id, None)
+
+    def get_session_spend(self, session_id: str) -> float:
+        with self._lock:
+            self._touch_session(session_id)
+            return float(self._session_spend.get(session_id, 0.0))
+
+    def record_session_spend(self, session_id: str, cost: float) -> None:
+        with self._lock:
+            self._touch_session(session_id)
+            self._session_spend[session_id] = self._session_spend.get(session_id, 0.0) + cost
 
     def calculate_avoided_cost(
         self,
@@ -2032,6 +2234,21 @@ class CircuitBreaker:
                         usd_saved=u_saved,
                     )
 
+            if self.session_limit > 0 and sess:
+                current_session_spend = self.get_session_spend(sess)
+                estimated_cost = self.estimate_cost(model, messages)
+                projected = current_session_spend + estimated_cost
+                if current_session_spend >= self.session_limit or projected > self.session_limit:
+                    spend_to_report = current_session_spend if current_session_spend >= self.session_limit else projected
+                    t_saved, u_saved = self.calculate_saved_telemetry(model, messages, session_id=sess, prompt_tokens=est_tokens)
+                    raise SessionBudgetLimitError(
+                        current_spend=spend_to_report,
+                        session_limit=self.session_limit,
+                        session_id=sess,
+                        tokens_saved=t_saved,
+                        usd_saved=u_saved,
+                    )
+
             if self.hourly_limit > 0:
                 current_hourly_spend = self.get_hourly_spend()
                 estimated_cost = self.estimate_cost(model, messages)
@@ -2092,6 +2309,8 @@ class CircuitBreaker:
         self._spend_records.append((now, final_cost))
         self._prune_old_spends(now)
         sess = session_id or "default"
+        if sess:
+            self.record_session_spend(sess, final_cost)
         if sess in self._session_history and self._session_history[sess]:
             self._session_history[sess][-1]["prompt_tokens"] = prompt_tokens
 
@@ -2114,6 +2333,8 @@ class CircuitBreaker:
             self._tool_history.clear()
             self._tool_repeat_state.clear()
             self._stagnant_steps.clear()
+            self._session_spend.clear()
+            self._session_last_seen.clear()
             self.kill_switch_active = False
 
     def toggle_kill_switch(self, active: Optional[bool] = None) -> bool:
@@ -2136,6 +2357,7 @@ class CircuitBreaker:
         profile: Optional[str] = None,
         max_burn_rate: Optional[str] = None,
         enable_context_ballooning: Optional[bool] = None,
+        session_limit: Optional[float] = None,
     ) -> None:
         """Dynamically update runtime limits and profile."""
         with self._lock:
@@ -2151,6 +2373,8 @@ class CircuitBreaker:
                 self.max_tool_repeats = int(max_tool_repeats)
             if max_stagnant_steps is not None and max_stagnant_steps >= 0:
                 self.max_stagnant_steps = int(max_stagnant_steps)
+            if session_limit is not None and session_limit >= 0:
+                self.session_limit = float(session_limit)
             if profile:
                 self.active_profile = str(profile).lower()
             if max_burn_rate is not None:
@@ -2187,6 +2411,10 @@ class CircuitBreaker:
             "dry_run": self.dry_run,
             "hourly_limit": self.hourly_limit,
             "daily_limit": self.daily_limit,
+            "session_limit": self.session_limit,
+            "max_active_sessions": self.max_active_sessions,
+            "session_ttl_seconds": self.session_ttl_seconds,
+            "active_sessions_count": len(self._session_last_seen),
             "max_burn_rate": self.max_burn_rate,
             "burn_rate_limit": self.burn_rate_limit,
             "burn_rate_window_seconds": self.burn_rate_window_seconds,
